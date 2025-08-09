@@ -52,18 +52,18 @@ PROTOC_OBJS = $(addprefix $(OBJ_DIR)/,   $(addsuffix .pb.o,  $(PROTO_NAMES)))
 
 # Objective files to build
 OBJS_SRV =  $(addprefix $(OBJ_DIR)/, $(addsuffix .o, $(basename $(notdir $(SRCS_SRV)))))
-OBJS_SRV += $(PROTOC_OBJS) $(GRPC_OBJS)
+OBJS_SRV += $(PROTOC_OBJS)
 
 OBJS_CLN =  $(addprefix $(OBJ_DIR)/, $(addsuffix .o, $(basename $(notdir $(SRCS_CLN)))))
-OBJS_CLN += $(PROTOC_OBJS) $(GRPC_OBJS)
+OBJS_CLN += $(PROTOC_OBJS)
 
 # Build target(s)
 all: $(EXE_SRV) $(EXE_CLN)
 
-$(EXE_SRV): $(PROTOC_CC) $(GRPC_CC) $(OBJS_SRV) 
+$(EXE_SRV): $(PROTOC_CC) $(OBJS_SRV)
 	$(LD) $(LDFLAGS) -o $(EXE_SRV) $(OBJS_SRV) $(LIBS)
 
-$(EXE_CLN): $(PROTOC_CC) $(GRPC_CC) $(OBJS_CLN) 
+$(EXE_CLN): $(PROTOC_CC) $(OBJS_CLN)
 	$(LD) $(LDFLAGS) -o $(EXE_CLN) $(OBJS_CLN) $(LIBS)
 
 # Compile source files
@@ -73,7 +73,7 @@ $(OBJ_DIR)/%.o: $(PROJECT_HOME)/%.cpp Makefile
 	-mkdir -p $(OBJ_DIR)
 	$(CC) -c -MP -MMD $(CFLAGS) $(INCS) -o $(OBJ_DIR)/$*.o $<
 	
-# Compile gRpc source files 
+# Compile protobuf source files
 $(OBJ_DIR)/%.o: $(PROTO_OUT)/%.cc Makefile
 	-mkdir -p $(OBJ_DIR)
 	$(CC) -c $(CFLAGS) $(INCS) -I$(PROTO_OUT) -o $(OBJ_DIR)/$*.o $<
