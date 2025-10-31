@@ -9,7 +9,6 @@
 #include <condition_variable>   // std::condition_variable
 #include <functional>           // std::function
 #include <list>                 // std::list
-#include <vector>               // std::vector
 #include <assert.h>             // assert()
 
 //
@@ -65,13 +64,12 @@ template<typename FUNC>
 class ThreadPoolEx : public ThreadPool
 {
 public:
-    ThreadPoolEx(FUNC func) : mFunc(func) {};
+    ThreadPoolEx(FUNC func) : mFunc(std::move(func)) {};
     ~ThreadPoolEx() = default;
 
     // Post arguments for a function to be executed by ThreadPool
     template<typename... ARGS>
-    //void Post(ARGS&&... args) { ThreadPool::Post(mFunc, std::forward<ARGS>(args)...); }
-    void Post(ARGS&&... args) { ThreadPool::Post(mFunc, args...); }
+    void Post(ARGS&&... args) { ThreadPool::Post(mFunc, std::forward<ARGS>(args)...); }
 
 private:
     FUNC mFunc;
