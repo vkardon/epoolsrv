@@ -123,7 +123,8 @@ inline int SetupServerDomainSocket(const char* sockName, bool isAbstract,
         return -1;
     }
 
-    // Prepare server address in the abstract namespace
+    // Prepare the server address structure for a Regular (Filesystem)
+    // or Abstract Namespace Unix Domain Socket.
     sockaddr_un serverAddress;
     memset(&serverAddress, 0, sizeof(serverAddress));
     serverAddress.sun_family = AF_UNIX;
@@ -136,7 +137,7 @@ inline int SetupServerDomainSocket(const char* sockName, bool isAbstract,
     }
     else
     {
-        // Regular domain socket
+        // Regular (Filesystem) socket
         strncpy(serverAddress.sun_path, sockName, sizeof(serverAddress.sun_path) - 1);
     }
 

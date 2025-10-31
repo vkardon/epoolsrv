@@ -115,7 +115,7 @@ inline bool EpollServer::Start(unsigned short port, int backlog)
 
     // Create listening NET socket (nonblocking)
     std::string errMsg;
-    mListenFd = gen::SetupServerSocket(port, false /*blocking*/, backlog, errMsg);
+    mListenFd = SetupServerSocket(port, false /*blocking*/, backlog, errMsg);
     if(mListenFd < 0)
     {
         OnError(__FNAME__, __LINE__, errMsg);
@@ -141,7 +141,7 @@ inline bool EpollServer::Start(const char* sockName, bool isAbstract, int backlo
 
     // Create listening unix domain socket (nonblocking)
     std::string errMsg;
-    mListenFd = gen::SetupServerDomainSocket(sockName, isAbstract, false /*blocking*/, backlog, errMsg);
+    mListenFd = SetupServerDomainSocket(sockName, isAbstract, false /*blocking*/, backlog, errMsg);
     if(mListenFd < 0)
     {
         OnError(__FNAME__, __LINE__, errMsg);

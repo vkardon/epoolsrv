@@ -35,18 +35,18 @@ inline const char* ProtoCodeToStr(PROTO_CODE code)
 
 inline bool ProtoSend(int sock, const void* buf, size_t len, long timeout_ms, std::string& errMsg)
 {
-    return gen::Send(sock, buf, len, 0, timeout_ms, errMsg);
+    return Send(sock, buf, len, 0, timeout_ms, errMsg);
 }
 
 inline bool ProtoRecv(int sock, void* buf, size_t len, long timeout_ms, std::string& errMsg)
 {
-    return gen::Recv(sock, buf, len, 0, timeout_ms, errMsg);
+    return Recv(sock, buf, len, 0, timeout_ms, errMsg);
 }
 
 inline bool ProtoSendInteger(int sock, uint32_t value, long timeout_ms, std::string& errMsg)
 {
     uint32_t data = htonl(value);
-    return gen::ProtoSend(sock, &data, sizeof(data), timeout_ms, errMsg);
+    return ProtoSend(sock, &data, sizeof(data), timeout_ms, errMsg);
 }
 
 inline bool ProtoRecvInteger(int sock, uint32_t& value, long timeout_ms, std::string& errMsg)
@@ -60,7 +60,7 @@ inline bool ProtoRecvInteger(int sock, uint32_t& value, long timeout_ms, std::st
 
 inline bool ProtoSendCode(int sock, PROTO_CODE code, long timeout_ms, std::string& errMsg)
 {
-    return gen::ProtoSendInteger(sock, code, timeout_ms, errMsg);
+    return ProtoSendInteger(sock, code, timeout_ms, errMsg);
 }
 
 inline bool ProtoValidateCode(uint32_t value, PROTO_CODE expectedCode, std::string& errMsg)
@@ -83,11 +83,11 @@ inline bool ProtoRecvCode(int sock, PROTO_CODE code, long timeout_ms, std::strin
     // Receive proto code from the client
     uint32_t value = 0;
 
-    if(!gen::ProtoRecvInteger(sock, value, timeout_ms, errMsg))
+    if(!ProtoRecvInteger(sock, value, timeout_ms, errMsg))
         return false;
 
     // Validate proto code
-    if(!gen::ProtoValidateCode(value, code, errMsg))
+    if(!ProtoValidateCode(value, code, errMsg))
         return false;
 
     return true;
@@ -96,17 +96,17 @@ inline bool ProtoRecvCode(int sock, PROTO_CODE code, long timeout_ms, std::strin
 inline bool ProtoSendData(int sock, PROTO_CODE code, const std::string& data, long timeout_ms, std::string& errMsg)
 {
     // Sent the data proto code
-    if(!gen::ProtoSendCode(sock, code, timeout_ms, errMsg))
+    if(!ProtoSendCode(sock, code, timeout_ms, errMsg))
         return false;
 
     // Send the data size
-    if(!gen::ProtoSendInteger(sock, data.length(), timeout_ms, errMsg))
+    if(!ProtoSendInteger(sock, data.length(), timeout_ms, errMsg))
         return false;
 
     // Send the data itself (if no empty)
     if(data.length() > 0)
     {
-        if(!gen::ProtoSend(sock, data.data(), data.length(), timeout_ms, errMsg))
+        if(!ProtoSend(sock, data.data(), data.length(), timeout_ms, errMsg))
             return false;
     }
 
@@ -116,12 +116,12 @@ inline bool ProtoSendData(int sock, PROTO_CODE code, const std::string& data, lo
 inline bool ProtoRecvData(int sock, PROTO_CODE code, std::string& data, long timeout_ms, std::string& errMsg)
 {
     // Receive the data code
-    if(!gen::ProtoRecvCode(sock, code, timeout_ms, errMsg))
+    if(!ProtoRecvCode(sock, code, timeout_ms, errMsg))
         return false;
 
     // Receive the data length
     uint32_t len = 0;
-    if(!gen::ProtoRecvInteger(sock, len, timeout_ms, errMsg))
+    if(!ProtoRecvInteger(sock, len, timeout_ms, errMsg))
         return false;
 
     // Receive the data (if available)
@@ -132,7 +132,7 @@ inline bool ProtoRecvData(int sock, PROTO_CODE code, std::string& data, long tim
         data.reserve(len);   // Reserve the desired capacity
         data.resize(len);    // Set the correct size of the string
 
-        if(!gen::ProtoRecv(sock, data.data(), len, timeout_ms, errMsg))
+        if(!ProtoRecv(sock, data.data(), len, timeout_ms, errMsg))
             return false;
     }
 
@@ -256,7 +256,7 @@ inline bool ParseFromData(const char* buffer, size_t bufferSize,
 inline bool ProtoSendData(int sock, PROTO_CODE code, const std::map<std::string, std::string>& data,
                           long timeout_ms, std::string& errMsg)
 {
-    std::string buffer = gen::SerializeToString(data);
+    std::string buffer = SerializeToString(data);
     return ProtoSendData(sock, code, buffer, timeout_ms, errMsg);
 }
 
@@ -267,7 +267,7 @@ inline bool ProtoRecvData(int sock, PROTO_CODE code, std::map<std::string, std::
     if(!ProtoRecvData(sock, code, buffer, timeout_ms, errMsg))
         return false;
 
-    return gen::ParseFromData(buffer.data(), buffer.size(), data, errMsg);
+    return ParseFromData(buffer.data(), buffer.size(), data, errMsg);
 }
 
 } // namespace gen

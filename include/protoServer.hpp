@@ -13,14 +13,14 @@ namespace gen {
 //
 // Send and receive Protobuf messages
 //
-class ProtoServer : public gen::EpollServer
+class ProtoServer : public EpollServer
 {
 public:
-    ProtoServer(int threadPoolSize) : gen::EpollServer(threadPoolSize) {}
+    ProtoServer(int threadPoolSize) : EpollServer(threadPoolSize) {}
     virtual ~ProtoServer() = default;
 
 protected:
-    // Override gen::EpollServer::OnInit() to be pure virtual (= 0) to force
+    // Override EpollServer::OnInit() to be pure virtual (= 0) to force
     // derived classes to provide a concrete implementation.
     virtual bool OnInit() override = 0;
 
@@ -133,7 +133,7 @@ inline bool ProtoServer::OnRead(std::shared_ptr<EpollServer::ClientContext>& cli
     if(client->messageState == ClientContextImpl::MessageState::READING_REQ_NAME)
     {
         std::string reqName;
-        if(!gen::ProtoRecvData(clientFd, PROTO_CODE::REQ_NAME, reqName, 0, errMsg))
+        if(!ProtoRecvData(clientFd, PROTO_CODE::REQ_NAME, reqName, 0, errMsg))
         {
             if(errno == ENOTCONN)
             {
@@ -167,7 +167,7 @@ inline bool ProtoServer::OnRead(std::shared_ptr<EpollServer::ClientContext>& cli
     {
         // Receive REQ (request data)
         std::string reqData;
-        if(!gen::ProtoRecvData(clientFd, PROTO_CODE::REQ, reqData, 0, errMsg))
+        if(!ProtoRecvData(clientFd, PROTO_CODE::REQ, reqData, 0, errMsg))
         {
             OnError(__FNAME__, __LINE__, std::string("Failed to receive REQ (request data): ") + errMsg);
             return false;
@@ -175,7 +175,7 @@ inline bool ProtoServer::OnRead(std::shared_ptr<EpollServer::ClientContext>& cli
 
         // Receive metadata
         std::map<std::string, std::string> metadata;
-        if(!gen::ProtoRecvData(clientFd, PROTO_CODE::METADATA, metadata, 0, errMsg))
+        if(!ProtoRecvData(clientFd, PROTO_CODE::METADATA, metadata, 0, errMsg))
         {
             OnError(__FNAME__, __LINE__, std::string("Failed to receive METADATA: ") + errMsg);
             return false;
@@ -205,7 +205,7 @@ inline bool ProtoServer::OnWrite(std::shared_ptr<EpollServer::ClientContext>& cl
     if(client->messageState == ClientContextImpl::MessageState::SENDING_ACK)
     {
         // Send ACK back to client to indicate we are ready to read more data
-        if(!gen::ProtoSendCode(clientFd, PROTO_CODE::ACK, 0, errMsg))
+        if(!ProtoSendCode(clientFd, PROTO_CODE::ACK, 0, errMsg))
         {
             OnError(__FNAME__, __LINE__, std::string("Failed to send ACK code: ") + errMsg);
             return false;
@@ -216,14 +216,14 @@ inline bool ProtoServer::OnWrite(std::shared_ptr<EpollServer::ClientContext>& cl
     else if(client->messageState == ClientContextImpl::MessageState::SENDING_NACK)
     {
         // Send NACK back to client to indicate we have no handler for the request
-        if(!gen::ProtoSendCode(clientFd, PROTO_CODE::NACK, 0, errMsg))
+        if(!ProtoSendCode(clientFd, PROTO_CODE::NACK, 0, errMsg))
         {
             OnError(__FNAME__, __LINE__, std::string("Failed to send NACK code: ") + errMsg);
             return false;
         }
 
         // Sent ERR (error message, could be empty)
-        if(!gen::ProtoSendData(clientFd, PROTO_CODE::ERR, client->errMsg, 0, errMsg))
+        if(!ProtoSendData(clientFd, PROTO_CODE::ERR, client->errMsg, 0, errMsg))
         {
             OnError(__FNAME__, __LINE__, std::string("Failed to send ERR (error message): ") + errMsg);
             return false;
@@ -234,14 +234,14 @@ inline bool ProtoServer::OnWrite(std::shared_ptr<EpollServer::ClientContext>& cl
     else if(client->messageState == ClientContextImpl::MessageState::SENDING_RESP)
     {
         // Send the response data
-        if(!gen::ProtoSendData(clientFd, PROTO_CODE::RESP, client->respData, 0, errMsg))
+        if(!ProtoSendData(clientFd, PROTO_CODE::RESP, client->respData, 0, errMsg))
         {
             OnError(__FNAME__, __LINE__, std::string("Failed to send RESP (response data): ") + errMsg);
             return false;
         }
 
         // Sent ERR (error message, could be empty)
-        if(!gen::ProtoSendData(clientFd, PROTO_CODE::ERR, client->errMsg, 0, errMsg))
+        if(!ProtoSendData(clientFd, PROTO_CODE::ERR, client->errMsg, 0, errMsg))
         {
             OnError(__FNAME__, __LINE__, std::string("Failed to send ERR (return value): ") + errMsg);
             return false;

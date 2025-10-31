@@ -52,12 +52,12 @@ inline ProtoClient::~ProtoClient()
 
 inline bool ProtoClient::Init(const char* domainSocketPath, std::string& errMsg)
 {
-    return ((mSocket = gen::SetupClientDomainSocket(domainSocketPath, errMsg)) > 0);
+    return ((mSocket = SetupClientDomainSocket(domainSocketPath, errMsg)) > 0);
 }
 
 inline bool ProtoClient::Init(const char* host, unsigned short port, std::string& errMsg)
 {
-    return ((mSocket = gen::SetupClientSocket(host, port, errMsg)) > 0);
+    return ((mSocket = SetupClientSocket(host, port, errMsg)) > 0);
 }
 
 // Call with metadata
@@ -92,7 +92,7 @@ inline bool ProtoClient::Call(const google::protobuf::Message& req,
         long remainingTimeoutMs = timeoutMs;
 
         // Sent the REQ_NAME (request name)
-        if(!gen::ProtoSendData(mSocket, PROTO_CODE::REQ_NAME, reqName, remainingTimeoutMs, errMsg))
+        if(!ProtoSendData(mSocket, PROTO_CODE::REQ_NAME, reqName, remainingTimeoutMs, errMsg))
             throw std::string("Failed to send REQ_NAME (request name): ") + errMsg;
 
         // Adjust timeout
@@ -103,7 +103,7 @@ inline bool ProtoClient::Call(const google::protobuf::Message& req,
 
         // Expecting ACK or NACK back from server
         uint32_t code = 0;
-        if(!gen::ProtoRecvInteger(mSocket, code, remainingTimeoutMs, errMsg))
+        if(!ProtoRecvInteger(mSocket, code, remainingTimeoutMs, errMsg))
             throw std::string("Failed to receive ACK/NACK code: ") + errMsg;
 
         // Adjust timeout
@@ -115,7 +115,7 @@ inline bool ProtoClient::Call(const google::protobuf::Message& req,
         if(code == PROTO_CODE::NACK)
         {
             // Receive ERR (error message)
-            if(!gen::ProtoRecvData(mSocket, PROTO_CODE::ERR, errMsgOut, remainingTimeoutMs, errMsg))
+            if(!ProtoRecvData(mSocket, PROTO_CODE::ERR, errMsgOut, remainingTimeoutMs, errMsg))
                 throw std::string("Failed to receive ERR (response value): ") + errMsg;
 
             // Note: Don't throw because it will close the socket; just return false
@@ -127,7 +127,7 @@ inline bool ProtoClient::Call(const google::protobuf::Message& req,
         }
 
         // Send the REQ (request data)
-        if(!gen::ProtoSendData(mSocket, PROTO_CODE::REQ, reqData, remainingTimeoutMs, errMsg))
+        if(!ProtoSendData(mSocket, PROTO_CODE::REQ, reqData, remainingTimeoutMs, errMsg))
             throw std::string("Failed to send REQ (request data): ") + errMsg;
 
         // Adjust timeout
@@ -137,7 +137,7 @@ inline bool ProtoClient::Call(const google::protobuf::Message& req,
         remainingTimeoutMs = std::chrono::duration_cast<std::chrono::milliseconds>(remaining).count();
 
         // Send metadata
-        if(!gen::ProtoSendData(mSocket, PROTO_CODE::METADATA, metadata, remainingTimeoutMs, errMsg))
+        if(!ProtoSendData(mSocket, PROTO_CODE::METADATA, metadata, remainingTimeoutMs, errMsg))
             throw std::string("Failed to send METADATA: ") + errMsg;
 
         // Adjust timeout
@@ -148,7 +148,7 @@ inline bool ProtoClient::Call(const google::protobuf::Message& req,
 
         // Receive RESP (response data)
         std::string respData;
-        if(!gen::ProtoRecvData(mSocket, PROTO_CODE::RESP, respData, remainingTimeoutMs, errMsg))
+        if(!ProtoRecvData(mSocket, PROTO_CODE::RESP, respData, remainingTimeoutMs, errMsg))
             throw std::string("Failed to receive RESP (respData data): ") + errMsg;
 
         // Adjust timeout
@@ -158,7 +158,7 @@ inline bool ProtoClient::Call(const google::protobuf::Message& req,
         remainingTimeoutMs = std::chrono::duration_cast<std::chrono::milliseconds>(remaining).count();
 
         // Receive ERR (error message)
-        if(!gen::ProtoRecvData(mSocket, PROTO_CODE::ERR, errMsgOut, remainingTimeoutMs, errMsg))
+        if(!ProtoRecvData(mSocket, PROTO_CODE::ERR, errMsgOut, remainingTimeoutMs, errMsg))
             throw std::string("Failed to receive ERR (response value): ") + errMsg;
 
         // Adjust timeout
