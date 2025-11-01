@@ -8,7 +8,7 @@
 #include <mutex>                // std::mutex
 #include <condition_variable>   // std::condition_variable
 #include <functional>           // std::function
-#include <list>                 // std::list
+#include <deque>                // std::deque
 #include <assert.h>             // assert()
 
 //
@@ -49,7 +49,7 @@ private:
     std::mutex mMutex;
     std::condition_variable mCv;
     std::condition_variable mCvDone;
-    std::list<std::function<void()>> mReqList;
+    std::deque<std::function<void()>> mReqList;
     bool mStop{false};
     unsigned long mStoppedCount{0};
     unsigned long mReqCount{0};
@@ -81,11 +81,11 @@ private:
 inline void ThreadPool::Start(int threadCount)
 {
     assert(mThreads.empty());
-    mThreads.resize(threadCount);
+    mThreadCount = threadCount;
 
-    for(auto& thread : mThreads)
+    for(int i = 0; i < threadCount; ++i)
     {
-        thread = std::thread([&]()
+        mThreads.emplace_back([&]()
         {
             bool isProcessing = false;
 
@@ -101,8 +101,7 @@ inline void ThreadPool::Start(int threadCount)
 
                 // Wait for a "New Request" notification
                 isProcessing = false;
-                while(mReqList.empty() && !mStop)
-                    mCv.wait(lock);
+                mCv.wait(lock, [this] { return !mReqList.empty() || mStop; });
 
                 // Do we have to stop?
                 if(mStop)
@@ -162,31 +161,15 @@ inline void ThreadPool::Wait()
     if(mReqCount == 0)
         return; // All requests are processed or never started
 
-    // We use loop to handle spurious wakeups
-    while(true)
+    // Wait until all requests are processed (mReqCount == 0) OR
+    // until all threads are stopped (mStoppedCount == mThreads.size())
+    mCvDone.wait(lock, [this] { return mReqCount == 0 || (mStop && mStoppedCount == mThreads.size()); });
+
+    // Handle 'Stop' scenario (if Wait is used to block until Stop is complete)
+    if(mStop && mStoppedCount == mThreads.size())
     {
-        mCvDone.wait(lock);
-
-        if(mStop)
-        {
-            if(mStoppedCount == mThreads.size())
-            {
-                // If are here because of "Stop" action, then
-                // all threads must be already stopped.
-                assert(mStoppedCount == mThreads.size());
-
-                // Wait for all threads to exit
-                JoinThreads();
-
-                // Restart threads
-                Start(mThreadCount);
-                break;
-            }
-        }
-        else if(mReqCount == 0)
-        {
-            break;
-        }
+        JoinThreads();          // Wait for all threads to exit
+        Start(mThreadCount);    // Restart threads
     }
 }
 
