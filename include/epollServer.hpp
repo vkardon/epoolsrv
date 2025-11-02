@@ -38,6 +38,10 @@ public:
 
     bool Start(unsigned short port, int backlog = DEFAULT_BACKLOG);
     bool Start(const char* sockName, bool isAbstract, int backlog = DEFAULT_BACKLOG);
+
+    bool AddListener(unsigned short port, int backlog = DEFAULT_BACKLOG);
+    bool AddListener(const char* sockName, bool isAbstract, int backlog = DEFAULT_BACKLOG);
+    bool Start();
     void Stop() { mServerRunning = false; }
 
     // Configuration
@@ -66,11 +70,10 @@ protected:
     virtual void OnInfo(const char* fname, int lineNum, const std::string& info) const;
 
 private:
-    bool StartImpl();
     bool CanAcceptNewConnection();
     void UpdateActivityTime(int clientFd);
     void CheckIdleConnections();
-    void HandleAcceptEvent();
+    void HandleAcceptEvent(int listenFd);
     void HandleReadEvent(int clientFd);
     void HandleWriteEvent(int clientFd);
     void CleanupClient(int clientFd);
@@ -79,7 +82,7 @@ private:
     void AddClientContext(int clientFd, const struct sockaddr_in& clientAddr);
     std::shared_ptr<ClientContext> GetClientContext(int clientFd);
 
-    bool EpollAdd(int fd, uint32_t events);
+    bool EpollAdd(int fd, uint32_t events, bool isListener);
     bool EpollMod(int fd, uint32_t events);
     bool EpollDel(int fd);
 
@@ -94,7 +97,7 @@ private:
     size_t mMaxConnections{DEFAULT_MAX_CONNECTIONS};
     std::atomic<bool> mServerRunning{false};
     int mEpollFd{-1};
-    int mListenFd{-1};
+    std::vector<int> mListenersFds;
     std::atomic<int> mNextConnectionId{1};
     std::map<int, std::shared_ptr<ClientContext>> mClientContexts;
     std::mutex mClientContextsMutex;
@@ -107,58 +110,59 @@ protected:
 
 inline bool EpollServer::Start(unsigned short port, int backlog)
 {
-    if(!OnInit())
-    {
-        OnError(__FNAME__, __LINE__, "Initialization failed: OnInit() returned false");
-        return false;
-    }
-
-    // Create listening NET socket (nonblocking)
-    std::string errMsg;
-    mListenFd = SetupServerSocket(port, false /*blocking*/, backlog, errMsg);
-    if(mListenFd < 0)
-    {
-        OnError(__FNAME__, __LINE__, errMsg);
-        return false;
-    }
-
-    {
-        std::stringstream ss;
-        ss << "Starting server on port " << port << ".";
-        OnInfo(__FNAME__, __LINE__, ss.str());
-    }
-
-    return StartImpl();
+    return AddListener(port, backlog) && Start();
 }
 
 inline bool EpollServer::Start(const char* sockName, bool isAbstract, int backlog)
 {
-    if(!OnInit())
-    {
-        OnError(__FNAME__, __LINE__, "Initialization failed: OnInit() returned false");
-        return false;
-    }
+    return AddListener(sockName, isAbstract, backlog) && Start();
+}
 
-    // Create listening unix domain socket (nonblocking)
+inline bool EpollServer::AddListener(unsigned short port, int backlog)
+{
+    // Create listening NET socket (nonblocking)
     std::string errMsg;
-    mListenFd = SetupServerDomainSocket(sockName, isAbstract, false /*blocking*/, backlog, errMsg);
-    if(mListenFd < 0)
+    int listenFd = SetupServerSocket(port, false /*blocking*/, backlog, errMsg);
+    if(listenFd < 0)
     {
         OnError(__FNAME__, __LINE__, errMsg);
         return false;
     }
+    mListenersFds.push_back(listenFd);
 
-    {
-        std::stringstream ss;
-        ss << "Starting server on domain socket" << (isAbstract ? " in abstract namespace " : " ") << "'" << sockName << "'.";
-        OnInfo(__FNAME__, __LINE__, ss.str());
-    }
-
-    return StartImpl();
+    std::stringstream ss;
+    ss << "Starting server on port " << port << ".";
+    OnInfo(__FNAME__, __LINE__, ss.str());
+    return true;
 }
 
-inline bool EpollServer::StartImpl()
+inline bool EpollServer::AddListener(const char* sockName, bool isAbstract, int backlog)
 {
+    // Create listening unix domain socket (nonblocking)
+    std::string errMsg;
+    int listenFd = SetupServerDomainSocket(sockName, isAbstract, false /*blocking*/, backlog, errMsg);
+    if(listenFd < 0)
+    {
+        OnError(__FNAME__, __LINE__, errMsg);
+        return false;
+    }
+    mListenersFds.push_back(listenFd);
+
+    std::stringstream ss;
+    ss << "Starting server on domain socket" << (isAbstract ? " in abstract namespace " : " ") << "'" << sockName << "'.";
+    OnInfo(__FNAME__, __LINE__, ss.str());
+    return true;
+}
+
+inline bool EpollServer::Start()
+{
+    if(!OnInit())
+    {
+        OnError(__FNAME__, __LINE__, "Initialization failed: OnInit() returned false");
+        Cleanup();
+        return false;
+    }
+
     // Create epoll instance
     mEpollFd = epoll_create1(0);
     if(mEpollFd == -1)
@@ -168,12 +172,15 @@ inline bool EpollServer::StartImpl()
         return false;
     }
 
-    // Add listening socket to epoll
-    if(!EpollAdd(mListenFd, EPOLLIN))
+    // Add listening sockets to epoll
+    for(int listenFd : mListenersFds)
     {
-        OnError(__FNAME__, __LINE__, "Error adding listening fd " + std::to_string(mListenFd) + " to epoll.");
-        Cleanup();
-        return false;
+        if(!EpollAdd(listenFd, EPOLLIN, true /*listener socket*/))
+        {
+            OnError(__FNAME__, __LINE__, "Error adding listening fd " + std::to_string(listenFd) + " to epoll.");
+            Cleanup();
+            return false;
+        }
     }
 
     OnInfo(__FNAME__, __LINE__, "Starting thread pool with " + std::to_string(mThreadsCount) + " worker threads.");
@@ -197,12 +204,17 @@ inline bool EpollServer::StartImpl()
         {
             for(int i = 0; i < numEvents; ++i)
             {
-                int fd = events[i].data.fd;
                 uint32_t event = events[i].events;
 
-                if(fd == mListenFd)
+                // Unpack event.data.u64 field to the socket file descriptor and listener boollean flag:
+                // - If the highest bit is set, it's a listener
+                // - Erase the highest bit (boolean flag bit) to unpack the socket
+                bool isListener = static_cast<bool>(events[i].data.u64 >> 63);
+                int fd = static_cast<int>(events[i].data.u64 & 0x7FFFFFFFFFFFFFFF); // Erase the highest bit
+
+                if(isListener)
                 {
-                    HandleAcceptEvent();
+                    HandleAcceptEvent(fd);
                 }
                 else
                 {
@@ -258,18 +270,22 @@ inline void EpollServer::Cleanup()
         mEpollFd = -1;
     }
 
-    if(mListenFd != -1)
+    for(int listenFd : mListenersFds)
     {
-        close(mListenFd);
-        mListenFd = -1;
+        close(listenFd);
     }
+    mListenersFds.clear();
 }
 
-inline bool EpollServer::EpollAdd(int fd, uint32_t events)
+inline bool EpollServer::EpollAdd(int fd, uint32_t events, bool isListener)
 {
     struct epoll_event event;
-    event.data.fd = fd;
     event.events = events;
+
+    // Use event.data.u64 field to pack both the socket and listener boollean flag.
+    // Set the least significant bits for the socket file descriptor and 
+    // the highest bit for the boolean flag.
+    event.data.u64 = static_cast<uint64_t>(isListener) << 63 | static_cast<uint64_t>(fd);
 
     if(epoll_ctl(mEpollFd, EPOLL_CTL_ADD, fd, &event) == -1)
     {
@@ -376,11 +392,11 @@ inline void EpollServer::CheckIdleConnections()
         CleanupClient(fd);
 }
 
-inline void EpollServer::HandleAcceptEvent()
+inline void EpollServer::HandleAcceptEvent(int listenFd)
 {
     sockaddr_in clientAddr;
     socklen_t clientAddressLen = sizeof(clientAddr);
-    int connFd = accept(mListenFd, (sockaddr*)&clientAddr, &clientAddressLen);
+    int connFd = accept(listenFd, (sockaddr*)&clientAddr, &clientAddressLen);
     if(connFd == -1)
     {
         OnError(__FNAME__, __LINE__, std::string("Accept failed: ") + strerror(errno));
@@ -391,7 +407,7 @@ inline void EpollServer::HandleAcceptEvent()
     {
         AddClientContext(connFd, clientAddr);
 
-        if(!EpollAdd(connFd, EPOLLIN | EPOLLRDHUP | EPOLLONESHOT))
+        if(!EpollAdd(connFd, EPOLLIN | EPOLLRDHUP | EPOLLONESHOT, false /*connection socket*/))
         {
             OnError(__FNAME__, __LINE__, "Error adding client fd " + std::to_string(connFd) + " to epoll.");
             close(connFd);

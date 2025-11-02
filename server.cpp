@@ -46,8 +46,7 @@ public:
 private:
     virtual bool OnInit() override
     {
-        Bind(&MyServer::OnPing);
-        return true;
+        return Bind(&MyServer::OnPing);
     }
 
     virtual void OnError(const char* fname, int lineNum, const std::string& err) const override
@@ -102,9 +101,10 @@ int main()
         server.Stop();
     });
 
-    // Start MyServer
-//    if(!server.Start(8080))
-    if(!server.Start("protoserver_domain_socket.sock", true))
+    // Configure MyServer to listen on both NET socket and Unix Domain socket
+    if(!server.AddListener(8080) ||
+       !server.AddListener("protoserver_domain_socket.sock", true) ||
+       !server.Start())
     {
         std::cerr << "Failed to start the epoll server." << std::endl;
         return 1;
