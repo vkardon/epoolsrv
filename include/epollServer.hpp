@@ -47,18 +47,24 @@ public:
     // Configuration
     void SetMaxEpollEventsCount(int maxEvents) { mMaxEvents = maxEvents; }
     void SetMaxConnections(int maxConnections) { mMaxConnections = maxConnections; }
-    void SetIdleTimeout(int timeoutSec) { mIdleTimeout = std::chrono::seconds(timeoutSec); }
+    void SetIdleTimeout(int timeoutSec) { mIdleTimeoutTicks = static_cast<uint64_t>(timeoutSec) * 1000000000ULL; }
     void SetVerbose(bool verbose) { mVerbose = verbose; }
 
 protected:
     struct ClientContext
     {
-        ClientContext() = default;
+        ClientContext() { UpdateTimestamp(); }
         virtual ~ClientContext() = default;
 
         int fd{-1};
-        std::chrono::time_point<std::chrono::steady_clock> lastActivityTime;
+        std::atomic<int64_t> lastActivityTime; // Store as nanoseconds since epoch in an atomic
         int connectionId{0};
+
+        void UpdateTimestamp() 
+        {
+            auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+            lastActivityTime.store(now, std::memory_order_relaxed);
+        }
     };
 
     // For derived class to override
@@ -71,7 +77,6 @@ protected:
 
 private:
     bool CanAcceptNewConnection();
-    void UpdateActivityTime(int clientFd);
     void CheckIdleConnections();
     void HandleAcceptEvent(int listenFd);
     void HandleReadEvent(int clientFd);
@@ -93,7 +98,7 @@ private:
 private:
     unsigned int mThreadsCount{0};
     int mMaxEvents{DEFAULT_MAX_EVENTS};
-    std::chrono::seconds mIdleTimeout{DEFAULT_IDLE_TIMEOUT};
+    uint64_t mIdleTimeoutTicks{static_cast<uint64_t>(DEFAULT_IDLE_TIMEOUT) * 1000000000ULL};
     size_t mMaxConnections{DEFAULT_MAX_CONNECTIONS};
     std::atomic<bool> mServerRunning{false};
     int mEpollFd{-1};
@@ -210,7 +215,7 @@ inline bool EpollServer::Start()
                 // - If the highest bit is set, it's a listener
                 // - Erase the highest bit (boolean flag bit) to unpack the socket
                 bool isListener = static_cast<bool>(events[i].data.u64 >> 63);
-                int fd = static_cast<int>(events[i].data.u64 & 0x7FFFFFFFFFFFFFFF); // Erase the highest bit
+                int fd = static_cast<int>(events[i].data.u64 & 0xFFFFFFFFULL); // We only need the bottom 32 bits
 
                 if(isListener)
                 {
@@ -232,17 +237,19 @@ inline bool EpollServer::Start()
         }
         else if(numEvents == 0) // Timeout occurred
         {
-            // Periodically check for idle connections
-            auto now = std::chrono::steady_clock::now();
-            if(now - lastIdleCheck > idleCheckInterval)
-            {
-                CheckIdleConnections();
-                lastIdleCheck = now;
-            }
+            //
         }
         else if(numEvents == -1 && errno != EINTR)
         {
             OnError(__FNAME__, __LINE__, "epoll_wait() failed in main loop: " + std::string(strerror(errno)));
+        }
+
+        // Periodically check for idle connections
+        auto now = std::chrono::steady_clock::now();
+        if(now - lastIdleCheck > idleCheckInterval)
+        {
+            CheckIdleConnections();
+            lastIdleCheck = now;
         }
     }
 
@@ -285,7 +292,9 @@ inline bool EpollServer::EpollAdd(int fd, uint32_t events, bool isListener)
     // Use event.data.u64 field to pack both the socket and listener boollean flag.
     // Set the least significant bits for the socket file descriptor and 
     // the highest bit for the boolean flag.
-    event.data.u64 = static_cast<uint64_t>(isListener) << 63 | static_cast<uint64_t>(fd);
+    // Note: Mask with 0xFFFFFFFFULL ensures we only take the 32 bits of the FD
+    // and don't accidentally pollute the 63rd bit via sign extension.
+    event.data.u64 = (static_cast<uint64_t>(isListener) << 63) | (static_cast<uint64_t>(fd) & 0xFFFFFFFFULL);
 
     if(epoll_ctl(mEpollFd, EPOLL_CTL_ADD, fd, &event) == -1)
     {
@@ -298,8 +307,14 @@ inline bool EpollServer::EpollAdd(int fd, uint32_t events, bool isListener)
 inline bool EpollServer::EpollMod(int fd, uint32_t events)
 {
     struct epoll_event event;
-    event.data.fd = fd;
     event.events = events;
+
+    // Explicitly set the 63rd bit to 0 (since only clients are MOD-ed)
+    // We use the same bit-packing format as EpollAdd so the main loop's
+    // "isListener" check stays valid.
+    // Note: Mask with 0xFFFFFFFFULL ensures we only take the 32 bits of the FD
+    // and don't accidentally pollute the 63rd bit via sign extension.
+    event.data.u64 = (static_cast<uint64_t>(0) << 63) | (static_cast<uint64_t>(fd) & 0xFFFFFFFFULL);
 
     if(epoll_ctl(mEpollFd, EPOLL_CTL_MOD, fd, &event) == -1)
     {
@@ -329,8 +344,8 @@ inline void EpollServer::AddClientContext(int clientFd, const struct sockaddr_in
 {
     std::shared_ptr<ClientContext> client = MakeClientContext();
     client->fd = clientFd;
-    client->lastActivityTime = std::chrono::steady_clock::now();
-    client->connectionId = mNextConnectionId++;
+    //client->connectionId = mNextConnectionId++;  // We don't need a heavy memory fence, we can use memory_order_relaxed
+    client->connectionId = mNextConnectionId.fetch_add(1, std::memory_order_relaxed);
 
     {
         std::lock_guard<std::mutex> lock(mClientContextsMutex);
@@ -356,25 +371,16 @@ inline std::shared_ptr<EpollServer::ClientContext> EpollServer::GetClientContext
     return (it != mClientContexts.end() ? it->second : nullptr);
 }
 
-inline void EpollServer::UpdateActivityTime(int clientFd)
-{
-    std::lock_guard<std::mutex> lock(mClientContextsMutex);
-    if(mClientContexts.count(clientFd))
-    {
-        mClientContexts[clientFd]->lastActivityTime = std::chrono::steady_clock::now();
-    }
-}
-
 inline void EpollServer::CheckIdleConnections()
 {
-    auto now = std::chrono::steady_clock::now();
+    uint64_t nowTicks = std::chrono::steady_clock::now().time_since_epoch().count();
     std::vector<int> clientsToClose;
 
     {
         std::lock_guard<std::mutex> lock(mClientContextsMutex);
         for(const auto &pair : mClientContexts)
         {
-            if((now - pair.second->lastActivityTime) > mIdleTimeout)
+            if((nowTicks - pair.second->lastActivityTime.load(std::memory_order_relaxed)) > mIdleTimeoutTicks)
             {
                 if(mVerbose)
                 {
@@ -442,7 +448,8 @@ inline void EpollServer::HandleReadEvent(int clientFd)
         return;
     }
 
-    UpdateActivityTime(clientFd);
+    // Update client activity time
+    client->UpdateTimestamp();
 
     // Immediately modify epoll to listen for EPOLLOUT
     if(!EpollMod(clientFd, EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLONESHOT))
@@ -471,7 +478,8 @@ inline void EpollServer::HandleWriteEvent(int clientFd)
         return;
     }
 
-    UpdateActivityTime(clientFd);
+    // Update client activity time
+    client->UpdateTimestamp();
 
     // Immediately modify epoll to listen for EPOLLIN again
     if(!EpollMod(clientFd, EPOLLIN | EPOLLRDHUP | EPOLLONESHOT))
