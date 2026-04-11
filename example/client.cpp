@@ -22,8 +22,7 @@ int getCurrentOpenFdCount()
         while((entry = readdir(dir)) != nullptr)
         {
             // We count all entries except "." and ".." which are the current and parent directories.
-            if(strcmp(entry->d_name, ".") != 0
-                    && strcmp(entry->d_name, "..") != 0)
+            if(strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0)
             {
                 count++;
             }

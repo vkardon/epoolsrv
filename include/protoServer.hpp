@@ -17,12 +17,12 @@ class ProtoServer : public EpollServer
 {
 public:
     ProtoServer(int threadPoolSize) : EpollServer(threadPoolSize) {}
-    virtual ~ProtoServer() = default;
+    ~ProtoServer() override = default;
 
 protected:
     // Override EpollServer::OnInit() to be pure virtual (= 0) to force
     // derived classes to provide a concrete implementation.
-    virtual bool OnInit() override = 0;
+    bool OnInit() override = 0;
 
     struct Context
     {
@@ -62,9 +62,9 @@ protected:
 
 private:
     // EpollServer overrides
-    virtual std::shared_ptr<ClientContext> MakeClientContext() override final;
-    virtual bool OnRead(std::shared_ptr<ClientContext>& client) override final;
-    virtual bool OnWrite(std::shared_ptr<ClientContext>& client) override final;
+    std::shared_ptr<ClientContext> MakeClientContext() override final;
+    bool OnRead(std::shared_ptr<ClientContext>& client) override final;
+    bool OnWrite(std::shared_ptr<ClientContext>& client) override final;
 
     // Base class for service-specific HandlerImpl class
     struct Handler
@@ -80,8 +80,7 @@ private:
     {
         typedef void (SERVER::*HANDLER_FPTR)(const Context& ctx, const REQ&, RESP&);
         HandlerImpl(SERVER* _srv, HANDLER_FPTR _fptr) : srv(_srv), fptr(_fptr) {}
-        virtual bool Call(const Context& ctx,
-                          const std::string& reqData, std::string& respData) override;
+        bool Call(const Context& ctx, const std::string& reqData, std::string& respData) override;
         SERVER* srv = nullptr;
         HANDLER_FPTR fptr = nullptr;
     };

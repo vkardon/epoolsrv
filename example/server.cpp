@@ -41,20 +41,20 @@ class MyServer : public gen::ProtoServer
 public:
     MyServer(size_t threadsCount) : gen::ProtoServer(threadsCount) {}
     MyServer() = delete;
-    virtual ~MyServer() = default;
+    ~MyServer() override = default;
 
 private:
-    virtual bool OnInit() override
+    bool OnInit() override
     {
         return Bind(&MyServer::OnPing);
     }
 
-    virtual void OnError(const char* fname, int lineNum, const std::string& err) const override
+    void OnError(const char* fname, int lineNum, const std::string& err) const override
     {
         std::cerr << fname << ":" << lineNum << " " << err << std::endl;
     }
 
-    virtual void OnInfo(const char* fname, int lineNum, const std::string& info) const override
+    void OnInfo(const char* fname, int lineNum, const std::string& info) const override
     {
         std::cout << fname << ":" << lineNum << " " << info << std::endl;
     }
