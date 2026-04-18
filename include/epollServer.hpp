@@ -467,7 +467,7 @@ inline void EpollServer::HandleWriteEvent(int clientFd)
     if(!client)
     {
         std::stringstream ss;
-        ss << "Client context not found for fd " << clientFd << " in read event.";
+        ss << "Client context not found for fd " << clientFd << " in write event.";
         OnError(__FNAME__, __LINE__, ss.str());
         return;
     }

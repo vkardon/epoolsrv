@@ -54,8 +54,8 @@
 namespace gen {
 
 #ifndef __FNAME__
-    // This constexpr method extracts the filename from a full path using
-    // the __FILE__ preprocessor variable, resolving at compile time.
+    // This constexpr method extracts the filename from a full path at compile time. 
+    // It is intended for use with the __FILE__ macro and performs no argument validation.
     constexpr const char* fname(const char* file, int i)
     {
         return (i == 0) ? (file) : (*(file + i) == '/' ? (file + i + 1) : fname(file, i - 1));
