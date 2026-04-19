@@ -123,11 +123,13 @@ inline std::shared_ptr<EpollServer::ClientContext> ProtoServer::MakeClientContex
     return std::make_shared<ClientContextImpl>();
 }
 
-inline bool ProtoServer::OnRead(std::shared_ptr<EpollServer::ClientContext>& client_)
+inline bool ProtoServer::OnRead(std::shared_ptr<EpollServer::ClientContext>& clientIn)
 {
-    ClientContextImpl* client = dynamic_cast<ClientContextImpl*>(client_.get());
+    ClientContextImpl* client = dynamic_cast<ClientContextImpl*>(clientIn.get());
     int clientFd = client->fd;
     std::string errMsg;
+
+    client->wantsWrite = true; // Signal the base class to add EPOLLOUT
 
     if(client->messageState == ClientContextImpl::MessageState::READING_REQ_NAME)
     {
@@ -195,11 +197,13 @@ inline bool ProtoServer::OnRead(std::shared_ptr<EpollServer::ClientContext>& cli
     }
 }
 
-inline bool ProtoServer::OnWrite(std::shared_ptr<EpollServer::ClientContext>& client_)
+inline bool ProtoServer::OnWrite(std::shared_ptr<EpollServer::ClientContext>& clientIn)
 {
-    ClientContextImpl* client = dynamic_cast<ClientContextImpl*>(client_.get());
+    ClientContextImpl* client = dynamic_cast<ClientContextImpl*>(clientIn.get());
     int clientFd = client->fd;
     std::string errMsg;
+
+    client->wantsWrite = false; // Signal the base class to stop asking for EPOLLOUT
 
     if(client->messageState == ClientContextImpl::MessageState::SENDING_ACK)
     {

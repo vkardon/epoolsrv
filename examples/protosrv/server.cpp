@@ -89,14 +89,14 @@ int main()
     MyServer server(threadsCount);
 //    server.SetVerbose(true);
 
-    // Start a helper thread to observer exit signal
+    // Starts a helper thread to monitor the exit signal
     std::thread signalObserverThread([&server]() 
     {
         while(gSignalNumber == 0)
             usleep(500000);
 
         // We got a signal. Stop the server.
-        std::cout << __FNAME__<< ":" << __LINE__ << " Got a signal " << gSignalNumber 
+        std::cout << __FNAME__ << ":" << __LINE__ << " Got a signal " << gSignalNumber 
                   << " (" << strsignal(gSignalNumber) << "), exiting..." << std::endl;
         server.Stop();
     });

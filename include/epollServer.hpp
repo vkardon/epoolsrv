@@ -23,7 +23,7 @@
 #include <sstream>
 #include <iomanip>
 #include "threadPool.hpp"
-#include "socketCommon.hpp"
+#include "utils.hpp"
 
 const int DEFAULT_BACKLOG = 512;
 const int DEFAULT_MAX_CONNECTIONS = 4096;
@@ -61,6 +61,7 @@ protected:
         int fd{-1};
         std::chrono::time_point<std::chrono::steady_clock> lastActivityTime;
         int connectionId{0};
+        std::atomic<bool> wantsWrite{false}; // Set by OnRead/OnWrite
     };
 
     // For derived class to override
@@ -78,7 +79,6 @@ private:
 
     std::string GetClientAddressInfo(const struct sockaddr_storage& clientAddr) const;
     bool CanAcceptNewConnection();
-    void UpdateActivityTime(int clientFd);
     void CheckIdleConnections();
     void HandleAcceptEvent(int listenFd);
     void HandleReadEvent(int clientFd);
@@ -129,7 +129,7 @@ inline bool EpollServer::AddListener(unsigned short port, int backlog)
 {
     // Create listening NET socket (nonblocking)
     std::string errMsg;
-    int listenFd = SetupServerSocket(port, false /*blocking*/, backlog, errMsg);
+    int listenFd = SetupServerSocket(port, true /*non-blocking*/, backlog, errMsg);
     if(listenFd < 0)
     {
         OnError(__FNAME__, __LINE__, errMsg);
@@ -147,7 +147,7 @@ inline bool EpollServer::AddListener(const char* sockName, bool isAbstract, int 
 {
     // Create listening unix domain socket (nonblocking)
     std::string errMsg;
-    int listenFd = SetupServerDomainSocket(sockName, isAbstract, false /*blocking*/, backlog, errMsg);
+    int listenFd = SetupServerDomainSocket(sockName, isAbstract, true /*non-blocking*/, backlog, errMsg);
     if(listenFd < 0)
     {
         OnError(__FNAME__, __LINE__, errMsg);
@@ -225,14 +225,16 @@ inline bool EpollServer::Start()
                 }
                 else
                 {
-                    // Queue a task for a worker thread to handle this event
-                    if(event & (EPOLLIN | EPOLLHUP | EPOLLRDHUP | EPOLLERR))
-                    {
-                        mThreadPool.Post(&EpollServer::HandleReadEvent, this, fd);
-                    }
-                    else if(event & EPOLLOUT)
+                    // Queue a task for a worker thread to handle Write event
+                    if(event & EPOLLOUT)
                     {
                         mThreadPool.Post(&EpollServer::HandleWriteEvent, this, fd);
+                    }
+                    // Queue a task for a worker thread to handle Read/Error event
+                    // ONLY if we aren't writing
+                    else if(event & (EPOLLIN | EPOLLHUP | EPOLLRDHUP | EPOLLERR))
+                    {
+                        mThreadPool.Post(&EpollServer::HandleReadEvent, this, fd);
                     }
                 }
             }
@@ -490,15 +492,6 @@ inline std::shared_ptr<EpollServer::ClientContext> EpollServer::GetClientContext
     return (it != mClientContexts.end() ? it->second : nullptr);
 }
 
-inline void EpollServer::UpdateActivityTime(int clientFd)
-{
-    std::lock_guard<std::mutex> lock(mClientContextsMutex);
-    if(mClientContexts.count(clientFd))
-    {
-        mClientContexts[clientFd]->lastActivityTime = std::chrono::steady_clock::now();
-    }
-}
-
 inline void EpollServer::CheckIdleConnections()
 {
     auto now = std::chrono::steady_clock::now();
@@ -528,50 +521,82 @@ inline void EpollServer::CheckIdleConnections()
 
 inline void EpollServer::HandleAcceptEvent(int listenFd)
 {
-    sockaddr_storage clientAddr{}; // Generic storage large enough for IPv6 or Unix
-    socklen_t clientAddressLen = sizeof(clientAddr);
-
-    int connFd = accept(listenFd, (sockaddr*)&clientAddr, &clientAddressLen);
-    if(connFd == -1)
+    // Since the listener is non-blocking, we must loop to drain the connection queue
+    while(mServerRunning)
     {
-        // Don't log error for EAGAIN/EWOULDBLOCK if using non-blocking listeners
-        // Note: Our listeners are blocking, but just to have more generic code.
-        if(errno != EAGAIN && errno != EWOULDBLOCK)
+        sockaddr_storage clientAddr{}; // Generic storage large enough for IPv6 or Unix
+        socklen_t clientAddressLen = sizeof(clientAddr);
+
+        int connFd = accept(listenFd, (sockaddr*)&clientAddr, &clientAddressLen);
+        if(connFd == -1)
         {
+            // Don't log error for EAGAIN/EWOULDBLOCK if using non-blocking listeners
+            // since it means that connection queue is empty
+            if(errno == EAGAIN || errno == EWOULDBLOCK)
+                break;
+
             OnError(__FNAME__, __LINE__, std::string("Accept failed: ") + strerror(errno));
+            break;
         }
-        return;
-    }
 
-    if(CanAcceptNewConnection())
-    {
-        AddClientContext(connFd, clientAddr);
-
-        if(!EpollAdd(connFd, EPOLLIN | EPOLLRDHUP | EPOLLONESHOT, false /*connection socket*/))
+        if(CanAcceptNewConnection())
         {
-            OnError(__FNAME__, __LINE__, "Error adding client fd " + std::to_string(connFd) + " to epoll.");
-            
-            // Note: Cleanup state before closing (Order is important)
+            // Set the new client socket to non-blocking
+            int flags = fcntl(connFd, F_GETFL, 0);
+            if(flags != -1)
+                fcntl(connFd, F_SETFL, flags | O_NONBLOCK);
+
+            // Create context and register with Epoll
+            AddClientContext(connFd, clientAddr);
+
+            if(!EpollAdd(connFd, EPOLLIN | EPOLLRDHUP | EPOLLONESHOT, false /*connection socket*/))
             {
-                std::lock_guard<std::mutex> lock(mClientContextsMutex);
-                mClientContexts.erase(connFd);
+                OnError(__FNAME__, __LINE__, "Error adding client fd " + std::to_string(connFd) + " to epoll.");
+                
+                // Cleanup internal state if epoll registration fails
+                {
+                    std::lock_guard<std::mutex> lock(mClientContextsMutex);
+                    mClientContexts.erase(connFd);
+                }
+                close(connFd);
             }
-            close(connFd);
+
+            // Successfully handled one connection; loop continues to check for the next.
         }
-    }
-    else
-    {
-        std::stringstream ss;
-        ss << "Maximum connections reached. Rejecting new connection from "
-           << GetClientAddressInfo(clientAddr) << ".";
-        OnError(__FNAME__, __LINE__, ss.str());
-        close(connFd); // Immediately close the connection
+        else
+        {
+            // The server is at mMaxConnections. We close this connection immediately,
+            // but we DO NOT 'break'. We keep looping to accept and close any other 
+            // pending connections so they don't sit in the kernel 'backlog' queue.
+            //if(mVerbose)
+            {
+                std::stringstream ss;
+                ss << "Maximum connections reached. Rejecting new connection from "
+                << GetClientAddressInfo(clientAddr) << ".";
+                OnError(__FNAME__, __LINE__, ss.str());
+            }
+            close(connFd); // Immediately close the connection
+
+            // Loop continues...
+        }
     }
 }
 
 inline void EpollServer::HandleReadEvent(int clientFd)
 {
-    std::shared_ptr<ClientContext> client = GetClientContext(clientFd);
+    std::shared_ptr<ClientContext> client;
+
+    {
+        std::lock_guard<std::mutex> lock(mClientContextsMutex);
+        auto it = mClientContexts.find(clientFd);
+        if(it != mClientContexts.end())
+        {
+            client = it->second;
+            client->lastActivityTime = std::chrono::steady_clock::now();
+        }
+    }
+
+    // std::shared_ptr<ClientContext> client = GetClientContext(clientFd);
     if(!client)
     {
         std::stringstream ss;
@@ -586,12 +611,12 @@ inline void EpollServer::HandleReadEvent(int clientFd)
         return;
     }
 
-    // Update client activity time
-    UpdateActivityTime(clientFd);
-
     // Immediately modify epoll to listen for EPOLLOUT
-    // Note: Because the send buffer is likely empty, this will immediately trigger a Write event.
-    if(!EpollMod(clientFd, EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLONESHOT))
+    uint32_t flags = EPOLLIN | EPOLLRDHUP | EPOLLONESHOT;
+    if(client->wantsWrite)
+        flags |= EPOLLOUT;
+
+    if(!EpollMod(clientFd, flags))
     {
         std::stringstream ss;
         ss << "Error modifying epoll for fd " << clientFd << " to include EPOLLOUT.";
@@ -602,7 +627,18 @@ inline void EpollServer::HandleReadEvent(int clientFd)
 
 inline void EpollServer::HandleWriteEvent(int clientFd)
 {
-    std::shared_ptr<ClientContext> client = GetClientContext(clientFd);
+    std::shared_ptr<ClientContext> client;
+
+    {
+        std::lock_guard<std::mutex> lock(mClientContextsMutex);
+        auto it = mClientContexts.find(clientFd);
+        if(it != mClientContexts.end())
+        {
+            client = it->second;
+            client->lastActivityTime = std::chrono::steady_clock::now();
+        }
+    }
+    
     if(!client)
     {
         std::stringstream ss;
@@ -617,11 +653,12 @@ inline void EpollServer::HandleWriteEvent(int clientFd)
         return;
     }
 
-    // Update client activity time
-    UpdateActivityTime(clientFd);
-
     // Immediately modify epoll to listen for EPOLLIN again
-    if(!EpollMod(clientFd, EPOLLIN | EPOLLRDHUP | EPOLLONESHOT))
+    uint32_t flags = EPOLLIN | EPOLLRDHUP | EPOLLONESHOT;
+    if(client->wantsWrite)
+        flags |= EPOLLOUT;
+
+    if(!EpollMod(clientFd, flags))
     {
         std::stringstream ss;
         ss << "Error modifying epoll for fd " << clientFd << " back to EPOLLIN.";
