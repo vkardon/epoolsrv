@@ -40,6 +40,9 @@ public:
               long timeoutMs = 5000);
 
 private:
+    int SetupClientSocket(const char* host, int port, std::string& errMsg);
+    int SetupClientDomainSocket(const char* domainSocketPath, std::string& errMsg);
+
     int mSocket{-1};
     std::string mErrMsg;
 };
@@ -58,6 +61,88 @@ inline bool ProtoClient::Init(const char* domainSocketPath, std::string& errMsg)
 inline bool ProtoClient::Init(const char* host, unsigned short port, std::string& errMsg)
 {
     return ((mSocket = SetupClientSocket(host, port, errMsg)) > 0);
+}
+
+inline int ProtoClient::SetupClientSocket(const char* host, int port, std::string& errMsg)
+{
+    if(!host || *host == '\0')
+    {
+        errMsg = "Socket creation failed: Invalid (empty) host name";
+        return -1;
+    }
+    else if(port == 0)
+    {
+        errMsg = "Socket creation failed: Invalid (zero) port number";
+        return -1;
+    }
+
+    // Create socket
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if(sock == -1)
+    {
+        errMsg = std::string("socket() failed: ") + strerror(errno);
+        return -1;
+    }
+
+    // Prepare server address
+    sockaddr_in serverAddress;
+    serverAddress.sin_family = AF_INET;
+    serverAddress.sin_port = htons(port);
+
+    if(inet_pton(AF_INET, host, &serverAddress.sin_addr) <= 0)
+    {
+        close(sock);
+        errMsg = std::string("inet_pton() failed: ") + strerror(errno);
+        return -1;
+    }
+
+    // Connect to the server
+    if(connect(sock, (sockaddr*) &serverAddress, sizeof(serverAddress)) == -1)
+    {
+        close(sock);
+        errMsg = std::string("connect() failed: ") + strerror(errno);
+        return -1;
+    }
+
+    return sock;
+}
+
+inline int ProtoClient::SetupClientDomainSocket(const char* domainSocketPath, std::string& errMsg)
+{
+    // Create a socket
+    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    if(sock == -1)
+    {
+        errMsg = std::string("socket() failed: ") + strerror(errno);
+        return -1;
+    }
+
+    // Prepare server address in the abstract namespace
+    sockaddr_un serverAddress;
+    memset(&serverAddress, 0, sizeof(serverAddress));
+    serverAddress.sun_family = AF_UNIX;
+
+    if(*domainSocketPath == '\0')
+    {
+        // Abstract namespace socket
+        serverAddress.sun_path[0] = 0;
+        strncpy(serverAddress.sun_path + 1, domainSocketPath + 1, sizeof(serverAddress.sun_path) - 2);
+    }
+    else
+    {
+        // Regular domain socket
+        strncpy(serverAddress.sun_path, domainSocketPath, sizeof(serverAddress.sun_path) - 1);
+    }
+
+    // Connect to the server
+    if(connect(sock, (sockaddr*)&serverAddress, sizeof(serverAddress)) == -1)
+    {
+        close(sock);
+        errMsg = std::string("connect() failed: ") + strerror(errno);
+        return -1;
+    }
+
+    return sock;
 }
 
 // Call with metadata

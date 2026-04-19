@@ -4,10 +4,16 @@
 #ifndef __PROTO_COMMON_HPP__
 #define __PROTO_COMMON_HPP__
 
-#include "socketCommon.hpp"
+#include <sys/socket.h>
+#include <poll.h>           // poll()
+#include <arpa/inet.h>      // htonl()/ntohl()
+#include <string.h>         // strerror()
 #include <string>
 #include <map>
-#include <cstring>  // std::memcpy
+#include <cstring>          // std::memcpy
+#include <sstream>
+#include <chrono>
+#include "socketCommon.hpp"
 
 namespace gen {
 
@@ -33,14 +39,252 @@ inline const char* ProtoCodeToStr(PROTO_CODE code)
             code == ERR       ? "ERR" : "UNKNOWN");
 }
 
-inline bool ProtoSend(int sock, const void* buf, size_t len, long timeout_ms, std::string& errMsg)
+// If timeout is 0, then ProtoSend() will block until all the requested data is available.
+// Returns: true if succeeded, false otherwise with errno set to:
+//    ETIMEDOUT  - operation timed out
+//    ECONNRESET - connection reset by peer
+inline bool ProtoSend(int sock, const void* buf, size_t len, long timeoutMs, std::string& errMsg)
 {
-    return Send(sock, buf, len, 0, timeout_ms, errMsg);
+    // Set up for poll() to implement the timeout
+    auto startTime = std::chrono::steady_clock::now();
+    size_t totalSent = 0;
+
+    while(totalSent < len)
+    {
+        if(timeoutMs > 0)
+        {
+            // Adjust timeout
+            auto elapsed = std::chrono::steady_clock::now() - startTime;
+            auto remaining = std::chrono::milliseconds(timeoutMs) - elapsed;
+
+            if(remaining <= std::chrono::microseconds(0))
+            {
+                std::stringstream ss;
+                ss << __FNAME__ << ":" << __LINE__ << " Timed out after " << timeoutMs << " ms";
+                errMsg = std::move(ss.str());
+                errno = ETIMEDOUT; // Timeout occurred
+                return false;
+            }
+
+            // Convert remaining time to milliseconds for poll()
+            long pollTimeoutMs = std::chrono::duration_cast<std::chrono::milliseconds>(remaining).count();
+
+            // Use poll() to wait for writeability with a timeout
+            pollfd fds[1];
+            fds[0].fd = sock;
+            fds[0].events = POLLOUT | POLLERR | POLLHUP; // Monitor for writeability
+            fds[0].revents = 0;
+
+            int retval = poll(fds, 1, pollTimeoutMs);
+
+            if(retval == -1)
+            {
+                if(errno == EINTR)
+                {
+                    // poll() interrupted by signal. Retry poll() with adjusted timeout
+                    continue;
+                }
+                else
+                {
+                    std::stringstream ss;
+                    ss << __FNAME__ << ":" << __LINE__ << " poll() failed: " << strerror(errno);
+                    errMsg = std::move(ss.str());
+                    return false; // Error in poll
+                }
+            }
+            else if(retval == 0)
+            {
+                std::stringstream ss;
+                ss << __FNAME__ << ":" << __LINE__ << " Timed out after " << timeoutMs << " ms";
+                errMsg = std::move(ss.str());
+                errno = ETIMEDOUT; // Timeout occurred
+                return false;
+            }
+
+            if(fds[0].revents & (POLLERR | POLLHUP))
+            {
+                std::stringstream ss;
+                ss << __FNAME__ << ":" << __LINE__ << " Connection error detected via poll";
+                errMsg = ss.str();
+                errno = ECONNRESET;
+                return false;
+            }
+            // OK, socket is writeable. Let's write to the socket
+            else if(!(fds[0].revents & POLLOUT))
+            {
+                // No POLLIN event, but poll returned > 0 (shouldn't happen in this simple read case)
+                // You might want to log a warning or handle other revents if needed
+                continue;
+            }
+        }
+
+        ssize_t bytesSent = send(sock, static_cast<const char*>(buf) + totalSent, len - totalSent, 0 /*flags*/);
+
+        if(bytesSent == -1)
+        {
+            if(errno == EINTR)
+            {
+                // send() interrupted by signal. Retry send() (poll will be retried too)
+                continue;
+            }
+            else if(errno == EAGAIN || errno == EWOULDBLOCK)
+            {
+                // Socket is non-blocking, try again later
+                continue;
+            }
+            else if(errno == EPIPE || errno == ECONNRESET)
+            {
+                // Connection likely closed by peer
+                std::stringstream ss;
+                ss << __FNAME__ << ":" << __LINE__ << " Connection closed by peer: " << strerror(errno);
+                errMsg = std::move(ss.str());
+                errno = ECONNRESET; // Indicate connection closure
+                return false;
+            }
+            else
+            {
+                std::stringstream ss;
+                ss << __FNAME__ << ":" << __LINE__ << " send() failed: " << strerror(errno);
+                errMsg = std::move(ss.str());
+                return false;
+            }
+        }
+        else if(bytesSent > 0)
+        {
+            totalSent += bytesSent;
+        }
+    }
+
+    return true;
 }
 
-inline bool ProtoRecv(int sock, void* buf, size_t len, long timeout_ms, std::string& errMsg)
+// If timeout is 0, then ProtoRecv() will block until all the requested data is available.
+// Returns: true if succeeded, false otherwise with errno set to:
+//    ETIMEDOUT  - operation timed out
+//    ECONNRESET - connection reset by peer
+//    ENOTCONN   - socket that is not connected
+inline bool ProtoRecv(int sock, void* buf, size_t len, long timeoutMs, std::string& errMsg)
 {
-    return Recv(sock, buf, len, 0, timeout_ms, errMsg);
+    // Set up for poll() to implement the timeout
+    auto startTime = std::chrono::steady_clock::now();
+    size_t totalReceived = 0;
+
+    while(totalReceived < len)
+    {
+        if(timeoutMs > 0)
+        {
+            // Adjust timeout
+            auto elapsed = std::chrono::steady_clock::now() - startTime;
+            auto remaining = std::chrono::milliseconds(timeoutMs) - elapsed;
+
+            if(remaining <= std::chrono::microseconds(0))
+            {
+                std::stringstream ss;
+                ss << __FNAME__ << ":" << __LINE__ << " Timed out after " << timeoutMs << " ms";
+                errMsg = std::move(ss.str());
+                errno = ETIMEDOUT; // Timeout occurred
+                return false;
+            }
+
+            // Convert remaining time to milliseconds for poll()
+            long pollTimeoutMs = std::chrono::duration_cast<std::chrono::milliseconds>(remaining).count();
+
+            // Use poll() to wait for readability with a timeout
+            pollfd fds[1];
+            fds[0].fd = sock;
+            fds[0].events = POLLIN | POLLERR | POLLHUP; // Monitor for readability
+            fds[0].revents = 0;
+
+            int retval = poll(fds, 1, pollTimeoutMs);
+
+            if(retval == -1)
+            {
+                if(errno == EINTR)
+                {
+                    // poll() interrupted by signal. Retry poll() with adjusted timeout
+                    continue;
+                }
+                else
+                {
+                    std::stringstream ss;
+                    ss << __FNAME__ << ":" << __LINE__ << " poll() failed: " << strerror(errno);
+                    errMsg = std::move(ss.str());
+                    return false; // Error in poll
+                }
+            }
+            else if(retval == 0)
+            {
+                std::stringstream ss;
+                ss << __FNAME__ << ":" << __LINE__ << " Timed out after " << timeoutMs << " ms";
+                errMsg = std::move(ss.str());
+                errno = ETIMEDOUT; // Timeout occurred
+                return false;
+            }
+
+            if(fds[0].revents & (POLLERR | POLLHUP))
+            {
+                std::stringstream ss;
+                ss << __FNAME__ << ":" << __LINE__ << " Connection error detected via poll";
+                errMsg = std::move(ss.str());
+                errno = ECONNRESET;
+                return false;
+            }
+            // OK, socket is readable. Let's read from the socket
+            else if(!(fds[0].revents & POLLIN))
+            {
+                // No POLLIN event, but poll returned > 0 (shouldn't happen in this simple read case)
+                // You might want to log a warning or handle other revents if needed
+                continue;
+            }
+        }
+
+        ssize_t bytesReceived = recv(sock, static_cast<char*>(buf) + totalReceived, len - totalReceived, 0 /*flags*/);
+
+        if(bytesReceived == -1)
+        {
+            if(errno == EINTR)
+            {
+                // recv() interrupted by signal. Retry recv() (poll will be retried too)
+                continue;
+            }
+            else if(errno == EAGAIN || errno == EWOULDBLOCK)
+            {
+                // No data available yet, but the call would not have blocked indefinitely.
+                // We should continue to the next iteration of the poll loop to wait for data
+                continue;
+            }
+            else
+            {
+                std::stringstream ss;
+                ss << __FNAME__ << ":" << __LINE__ << " recv() failed: " << strerror(errno);
+                errMsg = std::move(ss.str());
+                return false;
+            }
+        }
+        else if(bytesReceived == 0)
+        {
+            std::stringstream ss;
+            if(totalReceived == 0)
+            {
+                ss << __FNAME__ << ":" << __LINE__ << " Socket is not connected (recv returned 0)";
+                errno = ENOTCONN;   // Indicate that socket is not connected
+            }
+            else
+            {
+                ss << __FNAME__ << ":" << __LINE__ << " Connection closed by peer (recv returned 0)";
+                errno = ECONNRESET; // Indicate connection closure
+            }
+            errMsg = std::move(ss.str());
+            return false;
+        }
+        else
+        {
+            // Successfully received data
+            totalReceived += bytesReceived;
+        }
+    }
+
+    return true;
 }
 
 inline bool ProtoSendInteger(int sock, uint32_t value, long timeout_ms, std::string& errMsg)

@@ -9,6 +9,10 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <vector>
 #include <map>
 #include <memory>
@@ -18,10 +22,8 @@
 #include <chrono>
 #include <sstream>
 #include <iomanip>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include "socketCommon.hpp"
 #include "threadPool.hpp"
+#include "socketCommon.hpp"
 
 const int DEFAULT_BACKLOG = 512;
 const int DEFAULT_MAX_CONNECTIONS = 4096;
@@ -47,24 +49,18 @@ public:
     // Configuration
     void SetMaxEpollEventsCount(int maxEvents) { mMaxEvents = maxEvents; }
     void SetMaxConnections(int maxConnections) { mMaxConnections = maxConnections; }
-    void SetIdleTimeout(int timeoutSec) { mIdleTimeoutTicks = static_cast<uint64_t>(timeoutSec) * 1000000000ULL; }
+    void SetIdleTimeout(int timeoutSec) { mIdleTimeout = std::chrono::seconds(timeoutSec); }
     void SetVerbose(bool verbose) { mVerbose = verbose; }
 
 protected:
     struct ClientContext
     {
-        ClientContext() { UpdateTimestamp(); }
+        ClientContext() = default;
         virtual ~ClientContext() = default;
 
         int fd{-1};
-        std::atomic<int64_t> lastActivityTime; // Store as nanoseconds since epoch in an atomic
+        std::chrono::time_point<std::chrono::steady_clock> lastActivityTime;
         int connectionId{0};
-
-        void UpdateTimestamp() 
-        {
-            auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-            lastActivityTime.store(now, std::memory_order_relaxed);
-        }
     };
 
     // For derived class to override
@@ -76,8 +72,13 @@ protected:
     virtual void OnInfo(const char* fname, int lineNum, const std::string& info) const;
 
 private:
+    int SetupServerSocket(unsigned short port, bool nonblocking, int backlog, std::string& errMsg);
+    int SetupServerDomainSocket(const char* sockName, bool isAbstract, 
+                                int backlog, bool nonblocking, std::string& errMsg);
+
     std::string GetClientAddressInfo(const struct sockaddr_storage& clientAddr) const;
-     bool CanAcceptNewConnection();
+    bool CanAcceptNewConnection();
+    void UpdateActivityTime(int clientFd);
     void CheckIdleConnections();
     void HandleAcceptEvent(int listenFd);
     void HandleReadEvent(int clientFd);
@@ -99,7 +100,7 @@ private:
 private:
     unsigned int mThreadsCount{0};
     int mMaxEvents{DEFAULT_MAX_EVENTS};
-    uint64_t mIdleTimeoutTicks{static_cast<uint64_t>(DEFAULT_IDLE_TIMEOUT) * 1000000000ULL};
+    std::chrono::seconds mIdleTimeout{DEFAULT_IDLE_TIMEOUT};
     size_t mMaxConnections{DEFAULT_MAX_CONNECTIONS};
     std::atomic<bool> mServerRunning{false};
     int mEpollFd{-1};
@@ -335,6 +336,108 @@ inline bool EpollServer::EpollDel(int fd)
     return true;
 }
 
+inline int EpollServer::SetupServerSocket(unsigned short port, bool nonblocking, 
+                                          int backlog, std::string& errMsg)
+{
+    // Create socket
+    int sock = socket(AF_INET, (nonblocking ? SOCK_STREAM | SOCK_NONBLOCK : SOCK_STREAM), 0);
+    if(sock == -1)
+    {
+        errMsg = "socket() failed: " + std::string(strerror(errno));
+        return -1;
+    }
+
+    int reuse = 1;
+    if(setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0)
+    {
+        close(sock);
+        errMsg = "setsockopt(SO_REUSEADDR) failed: " + std::string(strerror(errno));
+        return -1;
+    }
+
+    // Bind the socket
+    sockaddr_in serverAddress;
+    serverAddress.sin_family = AF_INET;
+    serverAddress.sin_addr.s_addr = INADDR_ANY;
+    serverAddress.sin_port = htons(port);
+
+    if(bind(sock, (sockaddr*) &serverAddress, sizeof(serverAddress)) == -1)
+    {
+        close(sock);
+        errMsg = "bind() failed: " + std::string(strerror(errno));
+        return -1;
+    }
+
+    // Listen for connections
+    if(listen(sock, backlog) == -1)
+    {
+        close(sock);
+        errMsg = "listen() failed: " + std::string(strerror(errno));
+        return -1;
+    }
+
+    return sock;
+}
+
+inline int EpollServer::SetupServerDomainSocket(const char* sockName, bool isAbstract, 
+                                                int backlog, bool nonblocking, std::string& errMsg)
+{
+    if(!sockName || *sockName == '\0')
+    {
+        errMsg = "Socket creation failed: invalid (empty) socket name";
+        return -1;
+    }
+
+    // Create socket
+    int sock = socket(AF_UNIX, (nonblocking ? SOCK_STREAM | SOCK_NONBLOCK : SOCK_STREAM), 0);
+    if(sock == -1)
+    {
+        errMsg = "socket() failed: " + std::string(strerror(errno));
+        return -1;
+    }
+
+    // Prepare the server address structure for a Regular (Filesystem)
+    // or Abstract Namespace Unix Domain Socket.
+    sockaddr_un serverAddress;
+    memset(&serverAddress, 0, sizeof(serverAddress));
+    serverAddress.sun_family = AF_UNIX;
+
+    if(isAbstract)
+    {
+        // Abstract namespace socket
+        serverAddress.sun_path[0] = 0;
+        strncpy(serverAddress.sun_path + 1, sockName, sizeof(serverAddress.sun_path) - 2);
+    }
+    else
+    {
+        // Regular (Filesystem) socket
+        strncpy(serverAddress.sun_path, sockName, sizeof(serverAddress.sun_path) - 1);
+    }
+
+    // Unlink any existing socket with the same name (optional but good practice).
+    // This doesn't affect filesystem paths if this in the abstract namespace.
+    // However, it's a good idea to ensure a clean state if the program crashed previously.
+    unlink(serverAddress.sun_path);
+
+    // Bind the socket
+    if(bind(sock, (sockaddr*) &serverAddress, sizeof(serverAddress)) == -1)
+    {
+        close(sock);
+        errMsg = "bind() failed: " + std::string(strerror(errno));
+        return -1;
+    }
+
+    // Listen for connections
+    if(listen(sock, backlog) == -1)
+    {
+        close(sock);
+        errMsg = "listen() failed: " + std::string(strerror(errno));
+        return -1;
+    }
+
+    return sock;
+}
+
 inline std::string EpollServer::GetClientAddressInfo(const struct sockaddr_storage& clientAddr) const
 {
     if(clientAddr.ss_family == AF_INET)
@@ -363,8 +466,8 @@ inline void EpollServer::AddClientContext(int clientFd, const sockaddr_storage& 
 {
     std::shared_ptr<ClientContext> client = MakeClientContext();
     client->fd = clientFd;
-    //client->connectionId = mNextConnectionId++;  // We don't need a heavy memory fence, we can use memory_order_relaxed
-    client->connectionId = mNextConnectionId.fetch_add(1, std::memory_order_relaxed);
+    client->lastActivityTime = std::chrono::steady_clock::now();
+    client->connectionId = mNextConnectionId++;
 
     {
         std::lock_guard<std::mutex> lock(mClientContextsMutex);
@@ -387,16 +490,25 @@ inline std::shared_ptr<EpollServer::ClientContext> EpollServer::GetClientContext
     return (it != mClientContexts.end() ? it->second : nullptr);
 }
 
+inline void EpollServer::UpdateActivityTime(int clientFd)
+{
+    std::lock_guard<std::mutex> lock(mClientContextsMutex);
+    if(mClientContexts.count(clientFd))
+    {
+        mClientContexts[clientFd]->lastActivityTime = std::chrono::steady_clock::now();
+    }
+}
+
 inline void EpollServer::CheckIdleConnections()
 {
-    uint64_t nowTicks = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto now = std::chrono::steady_clock::now();
     std::vector<int> clientsToClose;
 
     {
         std::lock_guard<std::mutex> lock(mClientContextsMutex);
         for(const auto &pair : mClientContexts)
         {
-            if((nowTicks - pair.second->lastActivityTime.load(std::memory_order_relaxed)) > mIdleTimeoutTicks)
+            if((now - pair.second->lastActivityTime) > mIdleTimeout)
             {
                 if(mVerbose)
                 {
@@ -475,7 +587,7 @@ inline void EpollServer::HandleReadEvent(int clientFd)
     }
 
     // Update client activity time
-    client->UpdateTimestamp();
+    UpdateActivityTime(clientFd);
 
     // Immediately modify epoll to listen for EPOLLOUT
     // Note: Because the send buffer is likely empty, this will immediately trigger a Write event.
@@ -506,7 +618,7 @@ inline void EpollServer::HandleWriteEvent(int clientFd)
     }
 
     // Update client activity time
-    client->UpdateTimestamp();
+    UpdateActivityTime(clientFd);
 
     // Immediately modify epoll to listen for EPOLLIN again
     if(!EpollMod(clientFd, EPOLLIN | EPOLLRDHUP | EPOLLONESHOT))
