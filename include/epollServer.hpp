@@ -76,7 +76,8 @@ protected:
     virtual void OnInfo(const char* fname, int lineNum, const std::string& info) const;
 
 private:
-    bool CanAcceptNewConnection();
+    std::string GetClientAddressInfo(const struct sockaddr_storage& clientAddr) const;
+     bool CanAcceptNewConnection();
     void CheckIdleConnections();
     void HandleAcceptEvent(int listenFd);
     void HandleReadEvent(int clientFd);
@@ -84,7 +85,7 @@ private:
     void CleanupClient(int clientFd);
     void Cleanup();
 
-    void AddClientContext(int clientFd, const struct sockaddr_in& clientAddr);
+    void AddClientContext(int clientFd, const sockaddr_storage& clientAddr);
     std::shared_ptr<ClientContext> GetClientContext(int clientFd);
 
     bool EpollAdd(int fd, uint32_t events, bool isListener);
@@ -334,13 +335,31 @@ inline bool EpollServer::EpollDel(int fd)
     return true;
 }
 
+inline std::string EpollServer::GetClientAddressInfo(const struct sockaddr_storage& clientAddr) const
+{
+    if(clientAddr.ss_family == AF_INET)
+    {
+        const auto* addrPtr = reinterpret_cast<const sockaddr_in*>(&clientAddr);
+        char ip[INET_ADDRSTRLEN]{};
+        if(inet_ntop(AF_INET, &addrPtr->sin_addr, ip, INET_ADDRSTRLEN))
+        {
+            return std::string(ip) + ":" + std::to_string(ntohs(addrPtr->sin_port));
+        }
+    }
+    else if(clientAddr.ss_family == AF_UNIX)
+    {
+        return "UnixDomainSocket";
+    }
+    return "Unknown Protocol";
+}
+
 inline bool EpollServer::CanAcceptNewConnection()
 {
     std::lock_guard<std::mutex> lock(mClientContextsMutex);
     return (mClientContexts.size() < mMaxConnections);
 }
 
-inline void EpollServer::AddClientContext(int clientFd, const struct sockaddr_in &clientAddr)
+inline void EpollServer::AddClientContext(int clientFd, const sockaddr_storage& clientAddr)
 {
     std::shared_ptr<ClientContext> client = MakeClientContext();
     client->fd = clientFd;
@@ -352,14 +371,11 @@ inline void EpollServer::AddClientContext(int clientFd, const struct sockaddr_in
         mClientContexts[clientFd] = client;
     }
 
-    std::string clientIp = inet_ntoa(clientAddr.sin_addr);
-    unsigned short clientPort = ntohs(clientAddr.sin_port);
-
     if(mVerbose)
     {
         std::stringstream ss;
-        ss << "Connection " << client->connectionId << " from " << clientIp
-           << ":" << clientPort << " accepted, clientFd=" << clientFd << ".";
+        ss << "Connection " << client->connectionId << " from " << GetClientAddressInfo(clientAddr)
+           << " accepted, clientFd=" << clientFd << ".";
         OnInfo(__FNAME__, __LINE__, ss.str());
     }
 }
@@ -400,12 +416,18 @@ inline void EpollServer::CheckIdleConnections()
 
 inline void EpollServer::HandleAcceptEvent(int listenFd)
 {
-    sockaddr_in clientAddr;
+    sockaddr_storage clientAddr{}; // Generic storage large enough for IPv6 or Unix
     socklen_t clientAddressLen = sizeof(clientAddr);
+
     int connFd = accept(listenFd, (sockaddr*)&clientAddr, &clientAddressLen);
     if(connFd == -1)
     {
-        OnError(__FNAME__, __LINE__, std::string("Accept failed: ") + strerror(errno));
+        // Don't log error for EAGAIN/EWOULDBLOCK if using non-blocking listeners
+        // Note: Our listeners are blocking, but just to have more generic code.
+        if(errno != EAGAIN && errno != EWOULDBLOCK)
+        {
+            OnError(__FNAME__, __LINE__, std::string("Accept failed: ") + strerror(errno));
+        }
         return;
     }
 
@@ -416,16 +438,20 @@ inline void EpollServer::HandleAcceptEvent(int listenFd)
         if(!EpollAdd(connFd, EPOLLIN | EPOLLRDHUP | EPOLLONESHOT, false /*connection socket*/))
         {
             OnError(__FNAME__, __LINE__, "Error adding client fd " + std::to_string(connFd) + " to epoll.");
+            
+            // Note: Cleanup state before closing (Order is important)
+            {
+                std::lock_guard<std::mutex> lock(mClientContextsMutex);
+                mClientContexts.erase(connFd);
+            }
             close(connFd);
-            std::lock_guard<std::mutex> lock(mClientContextsMutex);
-            mClientContexts.erase(connFd);
         }
     }
     else
     {
         std::stringstream ss;
         ss << "Maximum connections reached. Rejecting new connection from "
-           << inet_ntoa(clientAddr.sin_addr) << ":" << ntohs(clientAddr.sin_port);
+           << GetClientAddressInfo(clientAddr) << ".";
         OnError(__FNAME__, __LINE__, ss.str());
         close(connFd); // Immediately close the connection
     }
@@ -452,6 +478,7 @@ inline void EpollServer::HandleReadEvent(int clientFd)
     client->UpdateTimestamp();
 
     // Immediately modify epoll to listen for EPOLLOUT
+    // Note: Because the send buffer is likely empty, this will immediately trigger a Write event.
     if(!EpollMod(clientFd, EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLONESHOT))
     {
         std::stringstream ss;

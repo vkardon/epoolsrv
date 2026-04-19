@@ -256,13 +256,6 @@ inline bool Recv(int sock, void* buf, size_t len, int flags, long timeoutMs, std
 {
     // Set up for poll() to implement the timeout
     auto startTime = std::chrono::steady_clock::now();
-    auto timeoutDuration = std::chrono::milliseconds(timeoutMs);
-
-    pollfd fds[1];
-    fds[0].fd = sock;
-    fds[0].events = POLLIN; // Monotor for readability
-    fds[0].revents = 0;
-
     size_t totalReceived = 0;
 
     while(totalReceived < len)
@@ -270,9 +263,8 @@ inline bool Recv(int sock, void* buf, size_t len, int flags, long timeoutMs, std
         if(timeoutMs > 0)
         {
             // Adjust timeout
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed = now - startTime;
-            auto remaining = timeoutDuration - elapsed;
+            auto elapsed = std::chrono::steady_clock::now() - startTime;
+            auto remaining = std::chrono::milliseconds(timeoutMs) - elapsed;
 
             if(remaining <= std::chrono::microseconds(0))
             {
@@ -287,6 +279,11 @@ inline bool Recv(int sock, void* buf, size_t len, int flags, long timeoutMs, std
             long pollTimeoutMs = std::chrono::duration_cast<std::chrono::milliseconds>(remaining).count();
 
             // Use poll() to wait for readability with a timeout
+            pollfd fds[1];
+            fds[0].fd = sock;
+            fds[0].events = POLLIN | POLLERR | POLLHUP; // Monitor for readability
+            fds[0].revents = 0;
+
             int retval = poll(fds, 1, pollTimeoutMs);
 
             if(retval == -1)
@@ -313,8 +310,16 @@ inline bool Recv(int sock, void* buf, size_t len, int flags, long timeoutMs, std
                 return false;
             }
 
+            if(fds[0].revents & (POLLERR | POLLHUP))
+            {
+                std::stringstream ss;
+                ss << __FNAME__ << ":" << __LINE__ << " Connection error detected via poll";
+                errMsg = std::move(ss.str());
+                errno = ECONNRESET;
+                return false;
+            }
             // OK, socket is readable. Let's read from the socket
-            if(!(fds[0].revents & POLLIN))
+            else if(!(fds[0].revents & POLLIN))
             {
                 // No POLLIN event, but poll returned > 0 (shouldn't happen in this simple read case)
                 // You might want to log a warning or handle other revents if needed
@@ -379,13 +384,6 @@ inline bool Send(int sock, const void* buf, size_t len, int flags, long timeoutM
 {
     // Set up for poll() to implement the timeout
     auto startTime = std::chrono::steady_clock::now();
-    auto timeoutDuration = std::chrono::milliseconds(timeoutMs);
-
-    pollfd fds[1];
-    fds[0].fd = sock;
-    fds[0].events = POLLOUT; // Monitor for writeability
-    fds[0].revents = 0;
-
     size_t totalSent = 0;
 
     while(totalSent < len)
@@ -393,9 +391,8 @@ inline bool Send(int sock, const void* buf, size_t len, int flags, long timeoutM
         if(timeoutMs > 0)
         {
             // Adjust timeout
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed = now - startTime;
-            auto remaining = timeoutDuration - elapsed;
+            auto elapsed = std::chrono::steady_clock::now() - startTime;
+            auto remaining = std::chrono::milliseconds(timeoutMs) - elapsed;
 
             if(remaining <= std::chrono::microseconds(0))
             {
@@ -410,6 +407,11 @@ inline bool Send(int sock, const void* buf, size_t len, int flags, long timeoutM
             long pollTimeoutMs = std::chrono::duration_cast<std::chrono::milliseconds>(remaining).count();
 
             // Use poll() to wait for writeability with a timeout
+            pollfd fds[1];
+            fds[0].fd = sock;
+            fds[0].events = POLLOUT | POLLERR | POLLHUP; // Monitor for writeability
+            fds[0].revents = 0;
+
             int retval = poll(fds, 1, pollTimeoutMs);
 
             if(retval == -1)
@@ -436,8 +438,16 @@ inline bool Send(int sock, const void* buf, size_t len, int flags, long timeoutM
                 return false;
             }
 
+            if(fds[0].revents & (POLLERR | POLLHUP))
+            {
+                std::stringstream ss;
+                ss << __FNAME__ << ":" << __LINE__ << " Connection error detected via poll";
+                errMsg = ss.str();
+                errno = ECONNRESET;
+                return false;
+            }
             // OK, socket is writeable. Let's write to the socket
-            if(!(fds[0].revents & POLLOUT))
+            else if(!(fds[0].revents & POLLOUT))
             {
                 // No POLLIN event, but poll returned > 0 (shouldn't happen in this simple read case)
                 // You might want to log a warning or handle other revents if needed
