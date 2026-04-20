@@ -414,12 +414,11 @@ inline int EpollServer::SetupServerDomainSocket(const char* sockName, bool isAbs
     {
         // Regular (Filesystem) socket
         strncpy(serverAddress.sun_path, sockName, sizeof(serverAddress.sun_path) - 1);
+        
+        // Unlink any existing socket with the same name. This is optional but
+        // good practice to ensure a clean state if the program crashed previously.
+        unlink(serverAddress.sun_path);
     }
-
-    // Unlink any existing socket with the same name (optional but good practice).
-    // This doesn't affect filesystem paths if this in the abstract namespace.
-    // However, it's a good idea to ensure a clean state if the program crashed previously.
-    unlink(serverAddress.sun_path);
 
     // Bind the socket
     if(bind(sock, (sockaddr*) &serverAddress, sizeof(serverAddress)) == -1)
