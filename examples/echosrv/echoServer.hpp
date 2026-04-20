@@ -5,7 +5,6 @@
 #define __ECHO_SERVER_HPP__
 
 #include "epollServer.hpp"
-#include <signal.h>
 
 class EchoServer : public gen::EpollServer
 {
