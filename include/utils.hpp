@@ -5,9 +5,7 @@
 #define __UTILS_HPP__
 
 #include <iostream>
-#include <iomanip>
 #include <chrono>
-#include <sstream>
 
 namespace gen {
 
@@ -38,17 +36,37 @@ namespace gen {
         }
     };
 
-    // "Hex Dump" function: Convert raw binary data into a human-readable hexadecimal string
-    inline std::string ToHex(const void* str, int len)
+    // "Hex Dump" function: Convert raw binary data into a human-readable
+    // hexadecimal string. It writes hex characters directly into a pre-allocated
+    // char array.
+    // NOTE: The 'dest' buffer must be at least (len * 2) in size.
+    inline void ToHex(char* dest, const void* str, int len) 
     {
-        const char* buf = static_cast<const char*>(str);
-        std::stringstream hex_stream;
-        hex_stream << std::hex << std::setfill('0');
-        for(int i = 0; i < len; i++)
-            hex_stream << std::setw(2) << static_cast<int>(buf[i]);
-        return hex_stream.str();
+        static const char* lut = "0123456789abcdef"; // Lookup table for hex digits
+
+        // Tight loop using bit-shifting (fastest way to split a byte)
+        const uint8_t* data = static_cast<const uint8_t*>(str);
+        for(int i = 0; i < len; ++i) 
+        {
+            *dest++ = lut[data[i] >> 4];   // High nibble
+            *dest++ = lut[data[i] & 0x0f]; // Low nibble
+        }
     }
 
+    // "Hex Dump" function: Convert raw binary data into a human-readable
+    // hexadecimal string
+    inline std::string ToHex(const void* str, int len) 
+    {
+        if(len <= 0) 
+            return {}; // Handle empty input gracefully
+        std::string res;
+        res.resize(len * 2);
+        ToHex(&res[0], str, len);
+        return res;
+    }
+
+    // "Hex Dump" function: Converts the entire contents of a string
+    // into a human-readable hexadecimal string 
     inline std::string ToHex(const std::string& str) 
     { 
         return ToHex(str.data(), str.size()); 
@@ -72,5 +90,9 @@ namespace gen {
 // Macro that strips the directory path from __FILE__.
 // Performed at compile-time using the constexpr gen::GetFileName helper.
 #define __FNAME__ gen::GetFileName(__FILE__)
+
+#define FTRACE(msg) do { \
+    std::cout << __FNAME__ << ":" << __LINE__ << " " << __func__ << "() " << msg << std::endl; \
+} while(0)
 
 #endif // __UTILS_HPP__
