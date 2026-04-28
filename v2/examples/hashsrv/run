@@ -1,0 +1,19 @@
+#!/bin/bash
+# Mon Apr 20 06:25:32 PM PDT 2026
+# By vkardon
+
+#echo "01 Some test string AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" | nc localhost 8080
+#cat client.cpp | nc localhost 8080
+
+#printf "String001\nString02\nString03\n" | nc localhost 8080
+
+printf "String001\nString02\n" | nc localhost 8080
+#printf "\n" | nc localhost 8080
+#printf "String001\n\n" | nc localhost 8080
+
+#cat data.txt | nc localhost 8080
+
+#printf "01 Some test string AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n" | nc localhost 8080
+#printf "01 Some test string AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" | sha256sum
+#exit
+
