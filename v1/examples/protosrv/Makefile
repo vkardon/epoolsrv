@@ -30,7 +30,7 @@ SRCS_CLN = $(PROJECT_HOME)/client.cpp
 
 # Protobuf files 
 ARC = $(shell uname -m)
-PROTOBUF_INSTALL = $(PROJECT_HOME)/../../protobuf.3.20.1.$(ARC)
+PROTOBUF_INSTALL = $(PROJECT_HOME)/../../../protobuf.3.20.1.$(ARC)
 PROTOC = $(PROTOBUF_INSTALL)/bin/protoc
 PROTO_OUT  = $(OBJ_DIR)/_generate
 PROTO_HOME = $(PROJECT_HOME)/protos

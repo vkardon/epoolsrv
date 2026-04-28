@@ -1,6 +1,5 @@
 # Top-level Makefile
 SUBDIRS = protosrv \
-          echosrv \
           hashsrv
 
 # Default target: build all subdirectories
