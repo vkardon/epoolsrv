@@ -48,6 +48,8 @@ protected:
         ClientContext() = default;
         virtual ~ClientContext() = default;
 
+        enum class RecvStatus { UNKNOWN=0, OK, DISCONNECT, ERROR };
+
         bool Send(const void* data, size_t len) 
         {
             if(outboundBuffer.size() + len > MAX_OUTBOUND_BUFFER_SIZE)
@@ -59,9 +61,11 @@ protected:
             return true;
         }
 
-        bool Receive(std::string& errMsg)
+        RecvStatus Receive(std::string& errMsg)
         {
-            char buf[8192];
+            char buf[4096];
+            RecvStatus status = RecvStatus::UNKNOWN;
+
             while(true)
             {
                 ssize_t n = recv(fd, buf, sizeof(buf), 0);
@@ -69,22 +73,32 @@ protected:
                 {
                     const uint8_t* p = reinterpret_cast<const uint8_t*>(buf);
                     inboundBuffer.insert(inboundBuffer.end(), p, p + n);
+                    continue; // Continue reading until EAGAIN
                 }
                 else if(n == 0)
                 {
-                    return false;
+                    // Peer closed, but we might have data in inboundBuffer!
+                    status = RecvStatus::DISCONNECT;
+                    break;
+                }
+                else if(errno == EAGAIN || errno == EWOULDBLOCK)
+                {
+                    status = RecvStatus::OK;
+                    break;
+                }
+                else if(errno == EINTR)
+                {
+                    continue;
                 }
                 else
                 {
-                    if(errno == EAGAIN || errno == EWOULDBLOCK)
-                        return true;
-                    if(errno == EINTR)
-                        continue;
-
                     errMsg = strerror(errno);
-                    return false;
+                    status = RecvStatus::ERROR;
+                    break;
                 }
             }
+
+            return status;
         }
 
         int fd{-1};
@@ -310,17 +324,30 @@ inline void EpollServer::ReactorLoop()
                 if(keepAlive && (events[i].events & EPOLLIN))
                 {
                     std::string recvErr;
-                    if(client->Receive(recvErr))
+                    auto status = client->Receive(recvErr);
+
+                    // Always process data if we have it, regardless of status
+                    if(!client->inboundBuffer.empty())
                     {
                         keepAlive = OnDataReceived(client);
-                        if(keepAlive && client->wantsWrite)
-                            keepAlive = FlushOutboundBuffer(client);
                     }
-                    else
+
+                    // If Receive signaled a disconnect or termination state, mark for closure
+                    if(status == ClientContext::RecvStatus::DISCONNECT)
                     {
-                        if(!recvErr.empty())
-                            OnError(__FNAME__, __LINE__, "Receive failed for ID " + std::to_string(client->connectionId) + ": " + recvErr);
                         keepAlive = false;
+                    }
+                    else if(status == ClientContext::RecvStatus::ERROR)
+                    {
+                        OnError(__FNAME__, __LINE__, "Receive error: " + recvErr);
+                        keepAlive = false;                    
+                    }
+                    
+                    // Flush any responses before the loop potentially closes the FD
+                    if(client->wantsWrite)
+                    {
+                        if(!FlushOutboundBuffer(client))
+                            keepAlive = false;
                     }
                 }
 
