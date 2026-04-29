@@ -1,6 +1,6 @@
 # Target(s) to build
-EXE_SRV = server
-EXE_CLN = client
+EXE_SRV = protoserver
+EXE_CLN = protoclient
 DEBUG = true
 
 # Compiler and linker to use

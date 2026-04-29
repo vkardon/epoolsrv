@@ -10,31 +10,27 @@ set(CMAKE_CXX_EXTENSIONS ON)
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
 
-# Asio is header-only on Ubuntu, but we need to find its location
-find_path(ASIO_INCLUDE_DIR asio.hpp)
-
 # Define the Executable
-add_executable(server_epool 
+add_executable(hashserver 
     main.cpp
     # Add other source files here
 )
 
 # Include Directories
-target_include_directories(server_epool PRIVATE 
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${ASIO_INCLUDE_DIR}
+target_include_directories(hashserver PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
     ${OPENSSL_INCLUDE_DIR}
 )
 
 # Link Libraries: libssl, libcrypto, pthread
-target_link_libraries(server_epool PRIVATE 
+target_link_libraries(hashserver PRIVATE 
     OpenSSL::SSL
     OpenSSL::Crypto
     Threads::Threads
 )
 
 # Compiler Flags: -Wall
-target_compile_options(server_epool PRIVATE -Wall)
+target_compile_options(hashserver PRIVATE -Wall)
 
 # CMake handles Debug/Release automatically via CMAKE_BUILD_TYPE.
 # If CMAKE_BUILD_TYPE is "Release", it adds -O3 and -DNDEBUG.

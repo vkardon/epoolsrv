@@ -1,5 +1,5 @@
 # Target(s) to build
-EXE = server
+EXE = hashserver
 DEBUG = true
 
 # Compiler and linker to use
