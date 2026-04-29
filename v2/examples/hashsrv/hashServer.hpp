@@ -98,3 +98,4 @@ inline bool HashServer::FinishAndSendHash(std::shared_ptr<ClientContextImpl>& cl
 }
 
 #endif // __HASH_SERVER_HPP__
+
