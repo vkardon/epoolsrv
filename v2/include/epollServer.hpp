@@ -11,6 +11,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <signal.h>
 #include <vector>
 #include <memory>
 #include <mutex>
@@ -19,11 +20,11 @@
 #include <chrono>
 #include <sstream>
 #include <cstring>
+#include <unordered_map>
 #include "utils.hpp"
 
 const int DEFAULT_BACKLOG = 1024;
 const int DEFAULT_MAX_EVENTS = 1024;
-const int MAX_ACCEPTS_PER_WAKEUP = 512; 
 const unsigned long MAX_CONNECTION_IDLE_TIME = 60;
 const size_t MAX_OUTBOUND_BUFFER_SIZE = 10 * 1024 * 1024;
 
@@ -32,7 +33,9 @@ namespace gen {
 class EpollServer
 {
 public:
-    EpollServer(unsigned int threadsCount) : mThreadsCount(threadsCount) {}
+    // Note: We ignore SIGPIPE so the server doesn't crash on broken sockets
+    EpollServer(unsigned int threadsCount)
+        : mThreadsCount(threadsCount), mMaxFds(GetMaxFiles()) { signal(SIGPIPE, SIG_IGN); }
     virtual ~EpollServer() { Stop(); }
 
     bool Start(unsigned short port, int backlog = DEFAULT_BACKLOG);
@@ -49,56 +52,8 @@ protected:
 
         enum class RecvStatus { UNKNOWN=0, OK, DISCONNECT, ERROR };
 
-        bool Send(const void* data, size_t len) 
-        {
-            if(outboundBuffer.size() + len > MAX_OUTBOUND_BUFFER_SIZE)
-                return false;
-
-            const uint8_t* p = static_cast<const uint8_t*>(data);
-            outboundBuffer.insert(outboundBuffer.end(), p, p + len);
-            wantsWrite = true;
-            return true;
-        }
-
-        RecvStatus Receive(std::string& errMsg)
-        {
-            char buf[4096];
-            RecvStatus status = RecvStatus::UNKNOWN;
-
-            while(true)
-            {
-                ssize_t n = recv(fd, buf, sizeof(buf), 0);
-                if(n > 0)
-                {
-                    const uint8_t* p = reinterpret_cast<const uint8_t*>(buf);
-                    inboundBuffer.insert(inboundBuffer.end(), p, p + n);
-                    continue; // Continue reading until EAGAIN
-                }
-                else if(n == 0)
-                {
-                    // Peer closed, but we might have data in inboundBuffer!
-                    status = RecvStatus::DISCONNECT;
-                    break;
-                }
-                else if(errno == EAGAIN || errno == EWOULDBLOCK)
-                {
-                    status = RecvStatus::OK;
-                    break;
-                }
-                else if(errno == EINTR)
-                {
-                    continue;
-                }
-                else
-                {
-                    errMsg = strerror(errno);
-                    status = RecvStatus::ERROR;
-                    break;
-                }
-            }
-
-            return status;
-        }
+        bool Send(const void* data, size_t len);
+        RecvStatus Receive(std::string& errMsg);
 
         int fd{-1};
         std::chrono::time_point<std::chrono::steady_clock> lastActivityTime;
@@ -106,7 +61,6 @@ protected:
         std::atomic<bool> wantsWrite{false};
         std::vector<uint8_t> inboundBuffer;
         std::vector<uint8_t> outboundBuffer;
-        size_t outOffset{0}; 
     };
 
     virtual bool OnInit() { return true; }
@@ -135,6 +89,7 @@ private:
     int mUnixDomainSocket{-1}; 
     std::string mActiveUnixPath;
     int mBacklog{DEFAULT_BACKLOG};
+    int mMaxFds{0};
 
 protected:
     bool mVerbose{false};
@@ -146,6 +101,16 @@ inline int EpollServer::GetMaxFiles()
     if(getrlimit(RLIMIT_NOFILE, &rl) == 0)
         return static_cast<int>(rl.rlim_cur);
     return 65535;
+}
+
+inline void EpollServer::OnError(const char* fname, int lineNum, const std::string& err) const
+{
+    std::cerr << "Error: " << fname << ":" << lineNum << " " << err << std::endl;
+}
+
+inline void EpollServer::OnInfo(const char* fname, int lineNum, const std::string& info) const
+{
+    std::cout << "Info: " << fname << ":" << lineNum << " " << info << std::endl;
 }
 
 inline bool EpollServer::Start(unsigned short port, int backlog)
@@ -213,9 +178,11 @@ inline void EpollServer::Stop()
     {
         if(mUnixDomainSocket >= 0)
             close(mUnixDomainSocket);
+        mUnixDomainSocket = -1;
+
         if(!mActiveUnixPath.empty())
             unlink(mActiveUnixPath.c_str());
-        mUnixDomainSocket = -1;
+        mActiveUnixPath.clear();
     }
 }
 
@@ -228,8 +195,8 @@ inline void EpollServer::ReactorLoop()
         return;
     }
 
-    int maxFds = GetMaxFiles();
-    std::vector<std::shared_ptr<ClientContext>> localClients(maxFds, nullptr);
+    std::unordered_map<int, std::shared_ptr<ClientContext>> localClients;
+    localClients.reserve(1024); // Start with a reasonable baseline
 
     int listenFd = (IsUnixSocket() ? mUnixDomainSocket : -1);
     if(listenFd == -1)
@@ -245,9 +212,9 @@ inline void EpollServer::ReactorLoop()
     }
 
     struct epoll_event ev;
-    ev.events = (IsUnixSocket() ? EPOLLIN : (EPOLLIN | EPOLLET)); 
-    ev.data.u64 = (static_cast<uint64_t>(1) << 63) | (static_cast<uint32_t>(listenFd));
-    
+    ev.events = EPOLLIN | EPOLLET;
+    ev.data.u32 = static_cast<uint32_t>(listenFd);
+
     if(epoll_ctl(threadEpollFd, EPOLL_CTL_ADD, listenFd, &ev) == -1)
     {
         OnError(__FNAME__, __LINE__, "epoll_ctl(listenFd) failed: " + std::string(strerror(errno)));
@@ -257,12 +224,13 @@ inline void EpollServer::ReactorLoop()
         return;
     }
 
-    struct epoll_event events[DEFAULT_MAX_EVENTS];
+    // Epool event processing loop
+    struct epoll_event evs[DEFAULT_MAX_EVENTS];
     auto lastCleanupTime = std::chrono::steady_clock::now();
 
     while(mServerRunning)
     {
-        int numEvents = epoll_wait(threadEpollFd, events, DEFAULT_MAX_EVENTS, 100);
+        int numEvents = epoll_wait(threadEpollFd, evs, DEFAULT_MAX_EVENTS, 100);
         if(numEvents < 0)
         {
             if(errno == EINTR)
@@ -272,64 +240,85 @@ inline void EpollServer::ReactorLoop()
 
         for(int i = 0; i < numEvents; ++i)
         {
-            uint64_t eventData = events[i].data.u64;
-            bool isListener = static_cast<bool>(eventData >> 63);
+            uint32_t events = evs[i].events;
+            int eventFd = static_cast<int>(evs[i].data.u32);
 
-            if(isListener)
+            if(eventFd == listenFd)
             {
-                int lfd = static_cast<int>(eventData & 0xFFFFFFFF);
-                int acceptCount = 0;
-                while(mServerRunning && acceptCount < MAX_ACCEPTS_PER_WAKEUP)
+                while(mServerRunning)
                 {
-                    int clientFd = accept4(lfd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+                    // Use accept4 to set non-blocking and cloexec immediately
+                    int clientFd = accept4(listenFd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+ 
                     if(clientFd == -1)
-                        break;
-
-                    if(clientFd >= maxFds)
                     {
+                        if(errno == EAGAIN || errno == EWOULDBLOCK)
+                        {
+                            break; // Queue is empty, we are done for this wakeup
+                        }
+                        else if(errno == EINTR)
+                        {
+                            continue; // Interrupted by signal, try again
+                        }
+                        else
+                        {
+                            OnError(__FNAME__, __LINE__, "accept4() failed: " + std::string(strerror(errno)));
+                            break;
+                        }
+                    }
+
+                    // Safety check for vector bounds
+                    if(clientFd >= mMaxFds)
+                    {
+                        OnError(__FNAME__, __LINE__, "Max FDs reached, closing connection");
                         close(clientFd);
                         continue;
                     }
 
-                    acceptCount++;
+                    // Register the new client with ONESHOT and ET (Edge Triggering)
+                    struct epoll_event cev;
+                    cev.events = EPOLLIN | EPOLLET | EPOLLRDHUP | EPOLLONESHOT;
+                    cev.data.u32 = static_cast<uint32_t>(clientFd);
+
+                    if(epoll_ctl(threadEpollFd, EPOLL_CTL_ADD, clientFd, &cev) == -1)
+                    {
+                        OnError(__FNAME__, __LINE__, "epoll_ctl(clientFd) failed: " + std::string(strerror(errno)));
+                        close(clientFd);
+                        continue;
+                    }
+
+                    // Initialize context
                     auto ctx = MakeClientContext();
                     ctx->fd = clientFd;
                     ctx->connectionId = mNextConnectionId.fetch_add(1, std::memory_order_relaxed);
                     ctx->lastActivityTime = std::chrono::steady_clock::now();
-                    
                     localClients[clientFd] = ctx;
 
-                    struct epoll_event cev;
-                    cev.events = EPOLLIN | EPOLLET | EPOLLRDHUP | EPOLLONESHOT;
-                    cev.data.u64 = static_cast<uint64_t>(clientFd);
-
-                    if(epoll_ctl(threadEpollFd, EPOLL_CTL_ADD, clientFd, &cev) == -1)
-                    {
-                        close(clientFd);
-                        localClients[clientFd] = nullptr;
-                    }
-                    else if(mVerbose)
+                    if(mVerbose)
                         OnInfo(__FNAME__, __LINE__, "Accepted connection ID: " + std::to_string(ctx->connectionId));
                 }
             }
             else
             {
-                int clientFd = static_cast<int>(eventData);
-                auto& client = localClients[clientFd];
-                if(!client)
+                int clientFd = eventFd;
+                auto it = localClients.find(clientFd);
+                if(it == localClients.end())
                     continue;
+                auto& client = it->second;
 
                 bool keepAlive = true;
                 client->lastActivityTime = std::chrono::steady_clock::now();
 
-                if(events[i].events & EPOLLOUT)
+                // Outbound processing block (standard EPOLLOUT)
+                if(events & EPOLLOUT)
                 {
                     keepAlive = FlushOutboundBuffer(client);
                     if(keepAlive && !client->wantsWrite)
                         keepAlive = OnDataSent(client);
                 }
 
-                if(keepAlive && (events[i].events & EPOLLIN))
+                // Inbound processing block
+                if(keepAlive && (events & EPOLLIN))
                 {
                     std::string recvErr;
                     auto status = client->Receive(recvErr);
@@ -359,11 +348,12 @@ inline void EpollServer::ReactorLoop()
                     }
                 }
 
-                if(!keepAlive || (events[i].events & (EPOLLRDHUP | EPOLLERR | EPOLLHUP)))
+                // Final cleanup for this iteration
+                if(!keepAlive || (events & (EPOLLRDHUP | EPOLLERR | EPOLLHUP)))
                 {
                     epoll_ctl(threadEpollFd, EPOLL_CTL_DEL, clientFd, nullptr);
                     close(clientFd);
-                    localClients[clientFd] = nullptr;
+                    localClients.erase(clientFd);
                 }
                 else
                 {
@@ -371,65 +361,54 @@ inline void EpollServer::ReactorLoop()
                     cev.events = EPOLLIN | EPOLLET | EPOLLRDHUP | EPOLLONESHOT;
                     if(client->wantsWrite)
                         cev.events |= EPOLLOUT;
-                    cev.data.u64 = static_cast<uint64_t>(clientFd);
+                    cev.data.u32 = static_cast<uint32_t>(clientFd);
 
                     if(epoll_ctl(threadEpollFd, EPOLL_CTL_MOD, clientFd, &cev) == -1)
                     {
+                        OnError(__FNAME__, __LINE__, "epoll_ctl(clientFd) failed: " + std::string(strerror(errno)));
                         close(clientFd);
-                        localClients[clientFd] = nullptr;
+                        localClients.erase(clientFd);
                     }
                 }
             }
         }
 
+        // Idle connections cleanup
         auto now = std::chrono::steady_clock::now();
         if(now - lastCleanupTime > std::chrono::seconds(5))
         {
-            for(int fd = 0; fd < maxFds; ++fd)
+            for(auto it = localClients.begin(); it != localClients.end();)
             {
-                if(localClients[fd] && (now - localClients[fd]->lastActivityTime > std::chrono::seconds(MAX_CONNECTION_IDLE_TIME)))
+                auto& client = it->second;
+                if(now - client->lastActivityTime > std::chrono::seconds(MAX_CONNECTION_IDLE_TIME))
                 {
                     if(mVerbose)
-                        OnInfo(__FNAME__, __LINE__, "Closing idle connection ID: " + std::to_string(localClients[fd]->connectionId));
-                    
-                    epoll_ctl(threadEpollFd, EPOLL_CTL_DEL, fd, nullptr);
-                    close(fd);
-                    localClients[fd] = nullptr;
+                        OnInfo(__FNAME__, __LINE__, "Closing idle connection ID: " + std::to_string(client->connectionId));
+
+                    // Cleanup: Close and remove from epoll
+                    epoll_ctl(threadEpollFd, EPOLL_CTL_DEL, it->first, nullptr);
+                    close(it->first);
+
+                    it = localClients.erase(it); // go to the next element
+                }
+                else
+                {
+                    ++it;
                 }
             }
             lastCleanupTime = now;
         }
     }
 
-    for(auto& client : localClients)
+    for(auto& [fd, client] : localClients)
     {
-        if(client)
-            close(client->fd);
+        close(fd);
     }
+    localClients.clear();
+
     if(IsTcpSocket() && listenFd >= 0)
         close(listenFd);
     close(threadEpollFd);
-}
-
-inline bool EpollServer::FlushOutboundBuffer(std::shared_ptr<ClientContext>& client)
-{
-    while(client->outOffset < client->outboundBuffer.size())
-    {
-        ssize_t n = send(client->fd, client->outboundBuffer.data() + client->outOffset, 
-                         client->outboundBuffer.size() - client->outOffset, MSG_NOSIGNAL);
-        if(n > 0)
-            client->outOffset += n;
-        else
-        {
-            if(errno == EAGAIN || errno == EWOULDBLOCK)
-                return true;
-            return false;
-        }
-    }
-    client->outboundBuffer.clear();
-    client->outOffset = 0;
-    client->wantsWrite = false;
-    return true;
 }
 
 inline int EpollServer::SetupTcpSocket(unsigned short port, int backlog, std::string& errMsg)
@@ -516,14 +495,84 @@ inline int EpollServer::SetupUnixSocket(const char* unixPath, int backlog, std::
     return sock;
 }
 
-inline void EpollServer::OnError(const char* fname, int lineNum, const std::string& err) const 
+inline bool EpollServer::FlushOutboundBuffer(std::shared_ptr<ClientContext>& client)
 {
-    std::cerr << "Error: " << fname << ":" << lineNum << " " << err << std::endl;
+    // As long as there is data in the vector, keep trying to send
+    while(!client->outboundBuffer.empty())
+    {
+        ssize_t n = send(client->fd, client->outboundBuffer.data(),
+                         client->outboundBuffer.size(), MSG_NOSIGNAL);
+
+        if(n > 0)
+        {
+            // Remove exactly what was sent from the front.
+            // This keeps the remaining data contiguous at the start of the vector.
+            client->outboundBuffer.erase(client->outboundBuffer.begin(),
+                                         client->outboundBuffer.begin() + n);
+        }
+        else
+        {
+            if(errno == EAGAIN || errno == EWOULDBLOCK)
+                return true; // Kernel buffer full, wait for next EPOLLOUT
+
+            return false; // Connection error or reset
+        }
+    }
+
+    // If we get here, the vector is empty
+    client->wantsWrite = false;
+    return true;
 }
 
-inline void EpollServer::OnInfo(const char* fname, int lineNum, const std::string& info) const 
+bool EpollServer::ClientContext::Send(const void* data, size_t len)
 {
-    std::cout << "Info: " << fname << ":" << lineNum << " " << info << std::endl;
+    if(outboundBuffer.size() + len > MAX_OUTBOUND_BUFFER_SIZE)
+        return false;
+
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    outboundBuffer.insert(outboundBuffer.end(), p, p + len);
+    wantsWrite = true;
+    return true;
+}
+
+EpollServer::ClientContext::RecvStatus EpollServer::ClientContext::Receive(std::string& errMsg)
+{
+    char buf[4096];
+    RecvStatus status = RecvStatus::UNKNOWN;
+
+    while(true)
+    {
+        ssize_t n = recv(fd, buf, sizeof(buf), 0);
+        if(n > 0)
+        {
+            const uint8_t* p = reinterpret_cast<const uint8_t*>(buf);
+            inboundBuffer.insert(inboundBuffer.end(), p, p + n);
+            continue; // Continue reading until EAGAIN
+        }
+        else if(n == 0)
+        {
+            // Peer closed, but we might have data in inboundBuffer!
+            status = RecvStatus::DISCONNECT;
+            break;
+        }
+        else if(errno == EAGAIN || errno == EWOULDBLOCK)
+        {
+            status = RecvStatus::OK;
+            break;
+        }
+        else if(errno == EINTR)
+        {
+            continue;
+        }
+        else
+        {
+            errMsg = strerror(errno);
+            status = RecvStatus::ERROR;
+            break;
+        }
+    }
+
+    return status;
 }
 
 } // namespace gen

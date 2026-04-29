@@ -84,10 +84,6 @@ private:
 
 int main()
 {
-    // Writing to an unconnected socket will cause a process to receive a SIGPIPE
-    // signal. We don't want to die if this happens, so we ignore SIGPIPE.
-    Signal(SIGPIPE, SIG_IGN);
-
     // Let the kernel know that we want to handle exit signals
     Signal(SIGHUP,  HandlerExitSignal);
     Signal(SIGINT,  HandlerExitSignal);
