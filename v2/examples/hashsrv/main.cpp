@@ -62,31 +62,20 @@ int main()
     HashServer server(threadsCount);
     // server.SetVerbose(true);
 
-    // Starts the observer thread to monitor the exit signal
-    std::thread signalObserverThread([&server]() 
-    {
-        // Wait until gSignalNumber is no longer 0
-        std::unique_lock<std::mutex> lock(gSignalMutex);
-        gSignalCV.wait(lock, []{ return gSignalNumber != 0; });
-
-        if(gSignalNumber > 0)   
-        {
-            std::cout << __FILE__ << ":" << __LINE__ << " Got a signal " << gSignalNumber 
-                      << " (" << strsignal(gSignalNumber) << "), exiting..." << std::endl;
-            server.Stop();
-        }
-    });
-
-    // Start HashServer
     if(!server.Start(8080))
     {
         std::cerr << "Failed to start the epoll server." << std::endl;
-        gSignalNumber = -1;  
-        gSignalCV.notify_all(); // Wake observer thread to join and exit    
+        return 1;
     }
 
-    // Join the observer thread and exit
-    signalObserverThread.join();
+    // Main thread waits for an exiting signal
+    {
+        std::unique_lock<std::mutex> lock(gSignalMutex);
+        gSignalCV.wait(lock, []{ return gSignalNumber != 0; });
+    }
+
+    std::cout << "Exiting on signal " << gSignalNumber << " (" << strsignal(gSignalNumber) << ")..." << std::endl;
+    server.Stop();
     return 0;
 }
 

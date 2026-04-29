@@ -5,9 +5,14 @@
 #include "protoServer.hpp"
 #include "hello.pb.h"
 #include <signal.h>
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
 
-// Handler for SIGHUP, SIGINT, SIGQUIT and SIGTERM
-volatile static sig_atomic_t gSignalNumber{0};
+// Synchronizing primitives
+static std::atomic<int> gSignalNumber{0};
+static std::mutex gSignalMutex;
+static std::condition_variable gSignalCV;
 
 extern "C"
 void HandlerExitSignal(int signalNumber)
@@ -25,6 +30,11 @@ void HandlerExitSignal(int signalNumber)
     write(STDOUT_FILENO, msg, strlen(msg));
 
     gSignalNumber = signalNumber;
+
+    // Wake up the observer thread.
+    // Note: notify_all is one of the few thread-safe calls allowed here.
+    // Since we use an atomic, the observer will definitely see the change.
+    gSignalCV.notify_all();
 }
 
 int Signal(int signum, void (*handler)(int))
@@ -89,31 +99,21 @@ int main()
     MyServer server(threadsCount);
 //    server.SetVerbose(true);
 
-    // Starts a helper thread to monitor the exit signal
-    std::thread signalObserverThread([&server]() 
-    {
-        while(gSignalNumber == 0)
-            usleep(500000);
-
-        // We got a signal. Stop the server.
-        std::cout << __FNAME__ << ":" << __LINE__ << " Got a signal " << gSignalNumber 
-                  << " (" << strsignal(gSignalNumber) << "), exiting..." << std::endl;
-        server.Stop();
-    });
-
-    // Configure MyServer to listen on both NET socket and Unix Domain socket
-    // if(!server.AddListener(8080) ||
-    //    !server.AddListener("\0protoserver_domain_socket.sock", true) ||
-    //    !server.Start())
-//    if(!server.Start(8080))
+ //    if(!server.Start(8080))
     if(!server.Start("\0protoserver_domain_socket.sock"))
     {
         std::cerr << "Failed to start the epoll server." << std::endl;
         return 1;
     }
 
-    // Join the helper thread and exit
-    signalObserverThread.join();
+    // Main thread waits for an exiting signal
+    {
+        std::unique_lock<std::mutex> lock(gSignalMutex);
+        gSignalCV.wait(lock, []{ return gSignalNumber != 0; });
+    }
+
+    std::cout << "Exiting on signal " << gSignalNumber << " (" << strsignal(gSignalNumber) << ")..." << std::endl;
+    server.Stop();
     return 0;
 }
 

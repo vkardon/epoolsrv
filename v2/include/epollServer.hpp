@@ -19,7 +19,6 @@
 #include <chrono>
 #include <sstream>
 #include <cstring>
-#include "threadPool.hpp"
 #include "utils.hpp"
 
 const int DEFAULT_BACKLOG = 1024;
@@ -130,7 +129,7 @@ private:
     unsigned int mThreadsCount{0};
     std::atomic<bool> mServerRunning{false};
     std::atomic<uint64_t> mNextConnectionId{1};
-    ThreadPool mThreadPool;
+    std::vector<std::thread> mThreads;
     
     unsigned short mPort{0};
     int mUnixDomainSocket{-1}; 
@@ -160,14 +159,13 @@ inline bool EpollServer::Start(unsigned short port, int backlog)
     mPort = port;
     mBacklog = backlog;
     mServerRunning = true;
-    mThreadPool.Start(mThreadsCount);
 
     std::stringstream ss;
     ss << "Starting Server on port " << port << " with " << mThreadsCount << " threads...";
     OnInfo(__FNAME__, __LINE__, ss.str());
 
     for(unsigned int i = 0; i < mThreadsCount; ++i)
-        mThreadPool.Post(&EpollServer::ReactorLoop, this);
+        mThreads.emplace_back([this]() { ReactorLoop(); });
 
     return true;
 }
@@ -189,10 +187,13 @@ inline bool EpollServer::Start(const char* unixPath, int backlog)
     }
     mBacklog = backlog;
     mServerRunning = true;
-    mThreadPool.Start(mThreadsCount);
+
+    std::stringstream ss;
+    ss << "Starting Server on Unix Domain Socket '" << mActiveUnixPath << "' with " << mThreadsCount << " threads...";
+    OnInfo(__FNAME__, __LINE__, ss.str());
 
     for(unsigned int i = 0; i < mThreadsCount; ++i)
-        mThreadPool.Post(&EpollServer::ReactorLoop, this);
+        mThreads.emplace_back([this]() { ReactorLoop(); });
 
     return true;
 }
@@ -200,7 +201,14 @@ inline bool EpollServer::Start(const char* unixPath, int backlog)
 inline void EpollServer::Stop() 
 { 
     mServerRunning = false; 
-    mThreadPool.Stop(); 
+
+    for(auto& t : mThreads)
+    {
+        if(t.joinable()) 
+            t.join();
+    }
+    mThreads.clear();
+
     if(IsUnixSocket())
     {
         if(mUnixDomainSocket >= 0)
